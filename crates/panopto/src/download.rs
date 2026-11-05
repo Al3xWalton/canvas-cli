@@ -2,7 +2,13 @@
 //!
 //! - **MP4 (default).** Panopto's composite MP4 is a signed CDN URL, fetched
 //!   without any cookie, written to `<dir>/.canvas-sync/tmp/<id>.part`,
-//!   checked against `Content-Length`, then renamed into place. No ffmpeg.
+//!   checked against the total size, then renamed into place. No ffmpeg.
+//! - **Resumable.** An interrupted download keeps its `.part` file. The next
+//!   run asks for the rest with `Range: bytes=<have>-` and appends only if
+//!   the server answers `206` with a matching `Content-Range`; a plain `200`
+//!   restarts from zero. The `.part` file is locked while in use, so two
+//!   runs never write it at once. If the signed URL has expired (`403`), a
+//!   fresh one is fetched once and the download continues.
 //! - **Separate streams (`--streams`).** Camera and screen feeds exist only
 //!   as HLS, so `ffmpeg -c copy` remuxes each to MP4 without re-encoding.
 //!   ffmpeg is restricted to https (`-protocol_whitelist`), so a hostile
@@ -13,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use canvas_core::{Error, Result, sanitize};
+use reqwest::header;
 use serde::Serialize;
 
 use crate::{Panopto, Recording};
@@ -96,6 +103,7 @@ impl Panopto {
                 recording.id
             )));
         }
+        clean_stale(&tmp);
         let stem = file_stem(recording);
         // Finished files are only ever renamed into place, so a non-empty
         // file under the final name is complete; an empty one is redone.
@@ -118,18 +126,25 @@ impl Panopto {
                 out.skipped.push(dest);
             } else {
                 progress(&format!("downloading {stem}.mp4"));
-                let part = tmp.join(format!("{}-{pid}.part", recording.id));
-                match self.fetch_to(url, &part).await {
-                    Ok(bytes) => {
-                        std::fs::rename(&part, &dest).map_err(io(&dest))?;
-                        out.bytes += bytes;
-                        out.written.push(dest);
+                let part = tmp.join(format!("{}.part", recording.id));
+                let result = match self.fetch_to(url, &part, &dest).await {
+                    // The signed link expired: get a fresh one and resume.
+                    Err(Error::Forbidden(_)) => {
+                        progress("download link expired; getting a fresh one");
+                        let fresh = self.recording(&recording.id).await?;
+                        let url = fresh.mp4_url.ok_or_else(|| {
+                            Error::NotFound(format!(
+                                "recording {} no longer has an MP4",
+                                recording.id
+                            ))
+                        })?;
+                        self.fetch_to(&url, &part, &dest).await
                     }
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&part);
-                        return Err(e);
-                    }
-                }
+                    other => other,
+                };
+                let bytes = result?;
+                out.bytes += bytes;
+                out.written.push(dest);
             }
         }
 
@@ -169,45 +184,195 @@ impl Panopto {
         Ok(out)
     }
 
-    /// Fetches a signed CDN URL (no cookie) into `dest`, checking length.
-    async fn fetch_to(&self, url: &str, dest: &Path) -> Result<u64> {
+    /// Fetches a signed CDN URL (no cookie) into `part`, resuming from
+    /// whatever `part` already holds, then renames it to `dest` while still
+    /// holding the lock. Returns the bytes received this call.
+    ///
+    /// A resume sends `If-Range` with the ETag (or Last-Modified) saved in
+    /// `<part>.meta` from the first response, so if the file changed on the
+    /// server it answers 200 and we restart instead of splicing two files.
+    /// Without a saved validator we restart. `part` is kept on transfer
+    /// errors and removed when it cannot be trusted.
+    async fn fetch_to(&self, url: &str, part: &Path, dest: &Path) -> Result<u64> {
         let parsed = url::Url::parse(url).map_err(|e| Error::Http(e.to_string()))?;
         if parsed.scheme() != "https" && !cfg!(test) {
             return Err(Error::Http("ReCap MP4 URL is not https".into()));
         }
-        let mut response = self
-            .http
-            .get(parsed)
+        let io = |source| Error::Io {
+            path: part.to_owned(),
+            source,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(part)
+            .map_err(io)?;
+        if file.try_lock().is_err() {
+            return Err(Error::Input(
+                "this recording is already being downloaded by another run".into(),
+            ));
+        }
+        let meta = part.with_extension("part.meta");
+        let validator = std::fs::read_to_string(&meta)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let mut have = file.metadata().map_err(io)?.len();
+        if have > 0 && validator.is_none() {
+            // Cannot prove the bytes match the server's file: start over.
+            file.set_len(0).map_err(io)?;
+            have = 0;
+        }
+        let mut request = self.http.get(parsed);
+        if let (true, Some(v)) = (have > 0, validator.as_deref()) {
+            request = request
+                .header(header::RANGE, format!("bytes={have}-"))
+                .header(header::IF_RANGE, v.trim());
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Http(format!("ReCap MP4 download returned {status}")));
-        }
-        let expected = response.content_length();
-        let io = |source| Error::Io {
-            path: dest.to_owned(),
-            source,
+        let (offset, total) = match status {
+            reqwest::StatusCode::PARTIAL_CONTENT => {
+                let range = response
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(content_range);
+                match range {
+                    Some((start, Some(total))) if start == have => (have, Some(total)),
+                    _ => {
+                        // Not the bytes we asked for: start over.
+                        drop(file);
+                        let _ = std::fs::remove_file(part);
+                        return Err(Error::Http(
+                            "ReCap server sent the wrong part of the file; run again to restart"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
+                // We may already have it all.
+                let total = response
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("bytes */"))
+                    .and_then(|v| v.parse::<u64>().ok());
+                if total == Some(have) && have > 0 {
+                    std::fs::rename(part, dest).map_err(|source| Error::Io {
+                        path: dest.to_owned(),
+                        source,
+                    })?;
+                    let _ = std::fs::remove_file(&meta);
+                    drop(file);
+                    return Ok(0);
+                }
+                drop(file);
+                let _ = std::fs::remove_file(part);
+                return Err(Error::Http(
+                    "ReCap download could not resume; run again to restart".into(),
+                ));
+            }
+            s if s.is_success() => {
+                // A full body: a fresh start, a changed file, or a server
+                // that ignores Range. Restart and remember its validator.
+                file.set_len(0).map_err(io)?;
+                let v = response
+                    .headers()
+                    .get(header::ETAG)
+                    .or_else(|| response.headers().get(header::LAST_MODIFIED))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                std::fs::write(&meta, v).map_err(io)?;
+                (0, response.content_length())
+            }
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
+                return Err(Error::Forbidden("ReCap MP4 link expired".into()));
+            }
+            s => return Err(Error::Http(format!("ReCap MP4 download returned {s}"))),
         };
-        let mut file = std::fs::File::create(dest).map_err(io)?;
-        let mut written = 0u64;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset)).map_err(io)?;
+        let mut received = 0u64;
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|e| Error::Http(e.to_string()))?
         {
             std::io::Write::write_all(&mut file, &chunk).map_err(io)?;
-            written += chunk.len() as u64;
+            received += chunk.len() as u64;
         }
         file.sync_all().map_err(io)?;
-        if let Some(expected) = expected.filter(|e| *e != written) {
+        let size = offset + received;
+        let Some(total) = total else {
+            return Err(Error::Http(
+                "ReCap did not say how big the MP4 is, so it cannot be checked; run again".into(),
+            ));
+        };
+        if size != total {
+            if size > total {
+                drop(file);
+                let _ = std::fs::remove_file(part);
+                let _ = std::fs::remove_file(&meta);
+            }
             return Err(Error::Http(format!(
-                "ReCap MP4 was {written} bytes, expected {expected}; it may have been cut off"
+                "ReCap MP4 is {size} of {total} bytes; run again to resume"
             )));
         }
-        Ok(written)
+        // Rename while the lock is still held, so no other run can reopen
+        // the finished part in between.
+        std::fs::rename(part, dest).map_err(|source| Error::Io {
+            path: dest.to_owned(),
+            source,
+        })?;
+        let _ = std::fs::remove_file(&meta);
+        drop(file);
+        Ok(received)
     }
+}
+
+/// Removes temp files older than a week that no run is using, including
+/// leftovers from recordings that were later deleted.
+fn clean_stale(tmp: &Path) {
+    const WEEK: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > WEEK);
+        if !old {
+            continue;
+        }
+        // Skip files another run holds locked.
+        let unlocked = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .is_ok_and(|f| f.try_lock().is_ok());
+        if unlocked {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Parses `Content-Range: bytes <start>-<end>/<total>` into
+/// `(start, Some(total))`; an unknown total (`*`) gives `None`.
+fn content_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let start = range.split_once('-')?.0.trim().parse().ok()?;
+    let total = total.trim().parse().ok();
+    Some((start, total))
 }
 
 async fn ffmpeg_available() -> Result<()> {
@@ -265,17 +430,61 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn serve(body: &'static str, length: usize) -> String {
+        serve_with(body, length, true, None).await
+    }
+
+    /// A stub CDN. With `ranges`, honours `Range: bytes=N-` with a 206;
+    /// otherwise always sends the full body. `cut` closes the connection
+    /// after that many body bytes on the first request only.
+    async fn serve_with(
+        body: &'static str,
+        length: usize,
+        ranges: bool,
+        cut: Option<usize>,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
+            let mut first = true;
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = vec![0; 4096];
-                let _ = socket.read(&mut buf).await;
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
-                );
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let from = request
+                    .lines()
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .and_then(|r| {
+                        r.trim_end_matches('-')
+                            .trim()
+                            .trim_end_matches('-')
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .filter(|_| ranges);
+                let from = from.filter(|_| request.contains("if-range: \"v1\""));
+                let (head, slice) = match from {
+                    Some(start) => (
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{length}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            length - 1,
+                            length - start
+                        ),
+                        &body[start..],
+                    ),
+                    None => (
+                        format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                        ),
+                        body,
+                    ),
+                };
                 let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(body.as_bytes()).await;
+                let slice = match cut.filter(|_| first) {
+                    Some(c) => &slice[..c.min(slice.len())],
+                    None => slice,
+                };
+                first = false;
+                let _ = socket.write_all(slice.as_bytes()).await;
             }
         });
         base
@@ -383,6 +592,90 @@ mod tests {
             Err(Error::Input(_))
         ));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_resumes_to_the_same_bytes() {
+        let body = "0123456789abcdefghij";
+        let base = serve_with(body, body.len(), true, Some(8)).await;
+        let r = recording(Some(format!("{base}/p.mp4")));
+        let d = dir("resume");
+        assert!(
+            recap()
+                .download(&r, &d, &DownloadOptions::default(), |_| {})
+                .await
+                .is_err()
+        );
+        let part = d.join(".canvas-sync/tmp").join(format!("{}.part", r.id));
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            b"01234567",
+            "partial kept for resume"
+        );
+        let got = recap()
+            .download(&r, &d, &DownloadOptions::default(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(got.bytes, 12, "only the rest was fetched");
+        assert_eq!(std::fs::read(&got.written[0]).unwrap(), body.as_bytes());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_ignoring_range_restarts_cleanly() {
+        let body = "0123456789abcdefghij";
+        let base = serve_with(body, body.len(), false, Some(8)).await;
+        let r = recording(Some(format!("{base}/p.mp4")));
+        let d = dir("norange");
+        assert!(
+            recap()
+                .download(&r, &d, &DownloadOptions::default(), |_| {})
+                .await
+                .is_err()
+        );
+        let got = recap()
+            .download(&r, &d, &DownloadOptions::default(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&got.written[0]).unwrap(),
+            body.as_bytes(),
+            "no corruption"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_without_a_saved_validator_restarts() {
+        let body = "0123456789abcdefghij";
+        let base = serve_with(body, body.len(), true, None).await;
+        let r = recording(Some(format!("{base}/p.mp4")));
+        let d = dir("novalidator");
+        let tmp = d.join(".canvas-sync/tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A stale part from some other file, with no .meta.
+        std::fs::write(tmp.join(format!("{}.part", r.id)), b"XXXXXXXX").unwrap();
+        let got = recap()
+            .download(&r, &d, &DownloadOptions::default(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&got.written[0]).unwrap(),
+            body.as_bytes(),
+            "never spliced"
+        );
+        assert!(
+            std::fs::read_dir(&tmp).unwrap().next().is_none(),
+            "temp files cleaned up"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn content_range_parses() {
+        assert_eq!(content_range("bytes 8-19/20"), Some((8, Some(20))));
+        assert_eq!(content_range("bytes 8-19/*"), Some((8, None)));
+        assert_eq!(content_range("items 1-2/3"), None);
     }
 
     #[tokio::test]
