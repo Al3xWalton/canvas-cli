@@ -1,0 +1,121 @@
+# Setting up canvas-cli (for agents)
+
+You are installing **canvas-cli**, an unofficial, read-only command-line tool
+for Canvas and Panopto ReCap, and connecting its MCP server (`canvas-mcp`) to
+yourself. Follow these steps in order. Run each command, check its result, and
+stop with a clear message to the user if a step fails. Do not skip the checks.
+
+The user must do one thing themselves: sign in through a browser window in
+step 6. Everything else you can do.
+
+## 1. Check the platform
+
+```bash
+uname -s
+```
+
+This must print `Darwin` (macOS). On anything else, tell the user that only
+macOS is supported for now and stop.
+
+## 2. Check the requirements
+
+```bash
+cargo --version && git --version && ls "/Applications/Google Chrome.app" >/dev/null && echo ok
+```
+
+- If `cargo` is missing, ask the user before installing Rust. Then run
+  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`
+  followed by `. "$HOME/.cargo/env"`.
+- If Google Chrome is missing, ask the user to install it from
+  https://www.google.com/chrome/ and wait.
+- `ffmpeg` is optional. It is only needed for `recap download --streams`.
+
+## 3. Get the code
+
+```bash
+git clone https://github.com/Al3xWalton/canvas-cli ~/canvas-cli && cd ~/canvas-cli
+```
+
+If `~/canvas-cli` already exists, run `cd ~/canvas-cli && git pull --ff-only`
+instead.
+
+## 4. Sign and install
+
+```bash
+make setup-signing && make install
+```
+
+`make setup-signing` creates a local code-signing certificate once, so macOS
+remembers keychain access across updates. It needs no password. `make install`
+builds `canvas` and `canvas-mcp` into `~/.cargo/bin` and signs them. The build
+takes a few minutes.
+
+Check that it worked:
+
+```bash
+~/.cargo/bin/canvas --version && ~/.cargo/bin/canvas-mcp --version
+```
+
+## 5. Point it at the right university
+
+The defaults are the university (`https://canvas.example.edu` and
+`example.hosted.panopto.com`). Ask the user which Canvas site they use. If it is
+different, write `~/.config/canvas-cli/config.toml`:
+
+```toml
+canvas_url = "https://<university>.instructure.com"
+panopto_host = "<university>.hosted.panopto.com"
+download_root = "/Users/<user>/Canvas"
+```
+
+Check the settings with `canvas config`.
+
+## 6. Sign in (the user does this)
+
+Tell the user: *"A Chrome window will open. Sign in to Canvas with your
+university account and MFA, then sign in to ReCap if it asks."* Then run:
+
+```bash
+~/.cargo/bin/canvas auth login
+```
+
+It waits up to 5 minutes for each sign-in. macOS may ask for keychain access.
+The user should click **Always Allow**.
+
+Check it:
+
+```bash
+~/.cargo/bin/canvas auth status
+```
+
+This should print `Signed in to ... as <name>` and `ReCap session  yes`.
+
+## 7. Connect the MCP server to yourself
+
+Pick the line for the client you are running in:
+
+```bash
+~/.cargo/bin/canvas mcp install --client claude   # Claude Code
+~/.cargo/bin/canvas mcp install --client codex    # OpenAI Codex CLI
+~/.cargo/bin/canvas mcp install --client cursor   # Cursor, or any client using mcpServers JSON
+```
+
+It prints the exact command or config to use. For Claude Code, run the
+`claude mcp add ...` line it prints. For the others, add the printed snippet
+to the named config file. Then tell the user to restart or reconnect the
+client so the `canvas` server loads.
+
+## 8. Verify
+
+Once reconnected, call the `auth_status` tool. It should return
+`signed_in: true`. Then call `usage` to read the guide to the tools.
+
+Tell the user setup is done and suggest a first question, such as *"What's due
+in the next 7 days?"*
+
+## If something fails later
+
+- `Canvas session expired or missing. Run canvas auth login.`: ask the user to
+  run `canvas auth login` again, then reconnect the server.
+- `canvas auth login --recap-only` renews only ReCap.
+- The `canvas` MCP server shows as failed: the session has expired. Same fix.

@@ -1,150 +1,91 @@
 # canvas-cli
 
-A command-line tool for Canvas and Panopto ReCap, with an MCP server so agents
-can use it. It reads course content, deadlines and grades, downloads course
-files and lecture recordings, and saves lecture transcripts for note writing.
-It only reads Canvas: it never submits, posts or changes anything there.
+An unofficial command-line tool and MCP server for Canvas and Panopto ReCap.
+`canvas` reads your courses, deadlines, announcements, pages and grades,
+downloads course files and lecture recordings, and saves lecture transcripts
+with chapter headings for note writing. `canvas-mcp` gives the same tools to
+an AI agent, so it can answer questions like `what's due this week` or
+`write notes from Tuesday's lecture`. It signs in through your browser, so it
+works where students can't create Canvas API tokens, and it only reads:
+nothing is ever submitted or changed on Canvas.
 
-It signs in with your browser, so it works where students cannot create
-Canvas API tokens.
+**Set it up with an agent.** Paste this into Claude Code, Codex or Cursor:
 
-```sh
-$ canvas assignments --due 2w
-Fri 13 Nov 12:00  ABC1016 (26/27)             Good Academic Practice - Online Quiz
-Mon 23 Nov 14:00  ABC1020 (26/27)             Assignment Part 2
-
-$ canvas recap transcript ABC1016 --latest 1
-2 file(s) saved, 0 without captions, 0 failed
-Transcripts are in ~/Canvas/ABC1016 (26_27)/ReCap
+```
+Download and set up the unofficial Canvas CLI and its MCP server by following https://github.com/Al3xWalton/canvas-cli/blob/main/SETUP.md
 ```
 
 ## Requirements
 
-- [Rust](https://www.rust-lang.org/tools/install) 1.95.0, pinned by `rust-toolchain.toml`
-- Google Chrome, for `canvas auth login`
-- Optional: [ffmpeg](https://ffmpeg.org), only for `recap download --streams`
-
-macOS is the tested platform. The session is stored in the macOS keychain.
+- macOS
+- [`rust`](https://www.rust-lang.org/tools/install)
+- Google Chrome (for sign-in)
+- [`ffmpeg`](https://ffmpeg.org), optional (only for `recap download --streams`)
 
 ## To install
 
-```sh
-git clone https://github.com/Al3xWalton/canvas-cli && cd canvas-cli
-make install
+Clone this repository
+
+```bash
+git clone https://github.com/Al3xWalton/canvas-cli && cd ./canvas-cli
 ```
 
-This installs two binaries, `canvas` and `canvas-mcp`, into `~/.cargo/bin`.
+Create a local signing certificate (once), then build and install `canvas`
+and `canvas-mcp` to `~/.cargo/bin`
 
-On macOS, run `make setup-signing` once before `make install`. It creates a
-local signing certificate so that, after you click **Always Allow** once per
-binary, updates do not ask for your keychain password again.
+```bash
+make setup-signing && make install
+```
 
-## To run
+Sign in. A Chrome window opens for your university sign-in and MFA, then ReCap
 
-Sign in once. A Chrome window opens: complete your university sign-in and MFA,
-then sign in to ReCap if it asks.
-
-```sh
+```bash
 canvas auth login
-canvas auth status
 ```
 
-Then ask Canvas things:
+The defaults are for the university. For another university, set
+`canvas_url` and `panopto_host` in `~/.config/canvas-cli/config.toml`.
 
-```sh
-canvas courses
+See what's due
+
+```bash
 canvas assignments --due 7d
-canvas calendar --days 7d
-canvas announcements --since 14d
-canvas modules ABC1020
-canvas pages ABC1020 module-information
-canvas grades
-canvas digest                      # what is new since the last run, plus what is due
 ```
 
-Name a course by id, code (`ABC1020`) or part of its name (`"example studies"`).
-Add `--json` to any command for machine-readable output.
+Write a lecture's transcript to the terminal
 
-Download things into `~/Canvas` (change it in the config):
-
-```sh
-canvas files sync ABC1020          # new and changed files only
-canvas files sync --all
-canvas recap list ABC1016
-canvas recap download ABC1016 --latest 1
-canvas recap transcript ABC1016 --latest 3
+```bash
 canvas recap transcript <viewer-url> --stdout
 ```
 
-When the session expires, commands fail with
-`Canvas session expired or missing. Run canvas auth login.` Run it again.
+Connect an agent (prints the exact command or config for your client)
 
-## Options
-
-| Command | What it does |
-|---|---|
-| `auth login / status / logout` | Sign in through Chrome, check, or forget the session |
-| `courses` | Active courses |
-| `assignments [--due 7d] [--course X]` | Work due soon, with submission state |
-| `calendar [--days 7d] [--course X]` | Timetabled events and dated assignments |
-| `announcements [--since 14d] [--course X]` | Announcements as Markdown |
-| `modules <course>` | Modules and their items |
-| `pages <course> [page]` | Pages, or one page as Markdown |
-| `discussions <course>` | Discussion topics with reply counts |
-| `quizzes <course>` | Classic quiz details (New Quizzes appear under `assignments`) |
-| `grades [course]` | Course totals, or one course's results |
-| `digest [--since last\|2d] [--upcoming 7d]` | Changes since the last run, plus what is due |
-| `files list / sync` | List, or incrementally download, course files |
-| `recap list <course>` | A course's lecture recordings |
-| `recap info <recording>` | Length, chapters, captions |
-| `recap download <recording\|course> [--latest N] [--streams]` | MP4 download |
-| `recap transcript <recording\|course> [--latest N] [--stdout]` | `.srt` and readable `.txt` with chapter headings |
-| `config` | Show the active settings |
-| `mcp install --client claude\|codex\|cursor` | Print the setup for an agent client |
-
-### Config
-
-`~/.config/canvas-cli/config.toml`, every field optional:
-
-```toml
-canvas_url = "https://canvas.example.edu"
-panopto_host = "example.hosted.panopto.com"
-download_root = "/Users/you/Canvas"
+```bash
+canvas mcp install --client claude
 ```
 
-## Connect an agent
+## Commands
 
-`canvas-mcp` is a stdio MCP server that runs on the session from
-`canvas auth login`. Add it to your client once:
+Name a course by id, code (`ABC1020`) or part of its name. Add `--json` to any
+command for machine-readable output.
 
-```sh
-canvas mcp install --client claude   # prints: claude mcp add --scope user canvas -- '<path>/canvas-mcp'
-```
+- `courses`, `assignments --due 7d`, `calendar --days 7d`, `grades [course]`: courses, deadlines, timetable and grades.
+- `announcements --since 14d`, `modules <course>`, `pages <course> [page]`, `discussions <course>`, `quizzes <course>`: course content as Markdown.
+- `digest`: what's new since the last run (announcements, assignments, files, recordings), plus what's due soon.
+- `files sync <course|--all>`: download new and changed course files to `~/Canvas`.
+- `recap list <course>`, `recap info <recording>`: a course's lecture recordings, with chapters.
+- `recap download <recording|course> --latest N`: save lectures as MP4. Interrupted downloads resume.
+- `recap transcript <recording|course> [--language all]`: save `.srt` and readable `.txt` transcripts.
+- `recap file <course> --into <Lectures folder> --apply`: file recordings into your own `L01 - ...` lecture folders. Without `--apply` it only shows the plan.
+- `auth login [--recap-only] | status | logout`: manage the browser session, kept in the macOS keychain.
+- `--help`: see every option.
 
-It offers the same reads and downloads as the CLI, plus a `digest` tool for
-notifications and `get_transcript` for lecture notes. A guide to the tools is
-sent to the agent when it connects. If the session has expired, the server
-exits at start-up and the client shows it as failed. Run `canvas auth login`,
-then reconnect.
+## Notes
 
-## How it works
-
-- **Canvas:** the read-only REST API (`/api/v1`), authenticated with the
-  browser session captured at sign-in.
-- **ReCap:** Panopto's viewer endpoint (`DeliveryInfo.aspx`) gives each
-  recording's composite MP4 and its per-source HLS streams, and
-  `GenerateSRT.ashx` gives captions. The approach was learned from
-  [travbend/panopto-downloader](https://github.com/travbend/panopto-downloader);
-  no code was taken from it.
-- **Security:**
-  - The session is stored only in the keychain and never printed.
-  - Cookies are sent only to the Canvas and Panopto hosts, never to download CDNs.
-  - Every name from Canvas is sanitised before it touches disk.
-  - Text written on Canvas is marked as untrusted for agents.
-
-Use it only for content you are allowed to access, and follow your
-university's policies on recordings.
-
-## License
-
-AGPL-3.0-only. See `LICENSE.md`.
+- Not affiliated with or endorsed by Instructure (Canvas) or Panopto. Use it
+  only for content you can already access, and follow your university's
+  policies on recordings.
+- The ReCap download approach was learned from
+  [travbend/panopto-downloader](https://github.com/travbend/panopto-downloader).
+  No code was taken from it.
+- AGPL-3.0-only. See `LICENSE.md`.
