@@ -25,7 +25,7 @@ anyhow = "1"
 dirs = "6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 futures = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
 keyring = { version = "3", features = ["apple-native"] }
 chromiumoxide = { version = "0.9", default-features = false }
 url = "2"

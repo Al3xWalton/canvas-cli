@@ -106,6 +106,9 @@ enum Command {
         /// Course id, code or part of the name.
         course: Option<String>,
     },
+    /// Panopto ReCap lecture recordings.
+    #[command(subcommand)]
+    Recap(RecapCommand),
     /// List or download course files.
     #[command(subcommand)]
     Files(FilesCommand),
@@ -132,6 +135,16 @@ enum AuthCommand {
     Status,
     /// Delete the stored session from the keychain.
     Logout,
+}
+
+/// `canvas recap ...`
+#[derive(Debug, Subcommand)]
+enum RecapCommand {
+    /// Show a recording's details and streams.
+    Info {
+        /// Viewer or embed URL, or the delivery ID.
+        recording: String,
+    },
 }
 
 /// `canvas files ...`
@@ -397,6 +410,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             out!("{score:>10}  {}", g.name);
                         }
                     }
+                }
+            }
+        }
+        Command::Recap(RecapCommand::Info { recording }) => {
+            let session = canvas_auth::load()?;
+            let recap = panopto::Panopto::new(&config, &session)?;
+            let r = recap.recording(&recording).await?;
+            if cli.json {
+                print_json(&r);
+            } else {
+                out!("{}", r.title);
+                if let Some(folder) = &r.folder {
+                    out!("folder     {folder}");
+                }
+                if let Some(t) = r.start_time {
+                    out!("recorded   {}", local_time(t));
+                }
+                out!("length     {}m", (r.duration_secs / 60.0).round());
+                out!(
+                    "mp4        {}",
+                    if r.mp4_url.is_some() { "yes" } else { "no" }
+                );
+                let kinds: Vec<&str> = r.streams.iter().map(|s| s.kind.as_str()).collect();
+                out!("streams    {}", kinds.join(", "));
+                out!("captions   {}", if r.has_captions { "yes" } else { "no" });
+                for c in &r.chapters {
+                    out!("  {:>5}m  {}", (c.start_secs / 60.0).floor(), c.title);
                 }
             }
         }

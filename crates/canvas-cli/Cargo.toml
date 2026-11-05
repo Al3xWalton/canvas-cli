@@ -20,6 +20,7 @@ serde_json.workspace = true
 canvas-auth.workspace = true
 canvas-api.workspace = true
 canvas-sync.workspace = true
+panopto.workspace = true
 tokio.workspace = true
 serde.workspace = true
 chrono.workspace = true
