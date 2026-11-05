@@ -35,6 +35,10 @@ make install
 
 This installs two binaries, `canvas` and `canvas-mcp`, into `~/.cargo/bin`.
 
+On macOS, run `make setup-signing` once before `make install`. It creates a
+local signing certificate so that, after you click **Always Allow** once per
+binary, updates do not ask for your keychain password again.
+
 ## To run
 
 Sign in once. A Chrome window opens: complete your university sign-in and MFA,
