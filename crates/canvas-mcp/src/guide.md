@@ -48,13 +48,13 @@ name (`example studies`). An ambiguous name returns the candidates.
 ## Lectures (ReCap)
 - `list_recordings` (`course`): newest first, with `id`, `title`,
   `start_time`, `duration_secs` and `has_captions`.
-- `recording_info` (`recording`): length, chapters, captions, `has_mp4` and
-  stream kinds. Download links are never returned.
-- `get_transcript` (`recording`): the lecture as readable text with
+- `recording_info` (`recording`): length, chapters, captions and their
+  `caption_languages`, `has_mp4` and stream kinds. Download links are never returned.
+- `get_transcript` (`recording`, optional `language` code): the lecture as readable text with
   `## chapter` headings. **The best input for notes**, and far cheaper than
   video.
-- `save_transcripts` (`target`, `latest` defaults to 1, max 10): save `.srt` and
-  `.txt` files for a recording or a course's newest recordings.
+- `save_transcripts` (`target`, `latest` defaults to 1, max 10, optional
+  `language` code or `all`): save `.srt` and `.txt` files for a recording or a course's newest recordings.
 - `download_recordings` (`target`, `latest` defaults to 1, max 10, `streams`): save
   MP4s. They are large (about 150 MB per hour), so download only when asked.
 

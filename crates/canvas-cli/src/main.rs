@@ -190,6 +190,10 @@ enum RecapCommand {
         /// Print one recording's transcript text instead of saving files.
         #[arg(long, conflicts_with_all = ["latest", "root"])]
         stdout: bool,
+        /// Caption language: a code from `recap info`, or `all`. Default:
+        /// the recording's first language.
+        #[arg(long, default_value = "default", value_parser = |s: &str| panopto::Language::parse(s).map_err(|e| e.to_string()))]
+        language: panopto::Language,
         /// Save here instead of the configured download_root.
         #[arg(long)]
         root: Option<std::path::PathBuf>,
@@ -664,6 +668,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             target,
             latest,
             stdout,
+            language,
             root,
         }) => {
             let session = canvas_auth::load()?;
@@ -671,11 +676,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if stdout {
                 let id = panopto::delivery_id(&target)?;
                 let recording = recap.recording(&id).await?;
-                let t = recap.transcript(&recording).await?;
+                let codes = panopto::languages(&recording, language)?;
+                let mut all = Vec::new();
+                for code in codes {
+                    all.push(recap.transcript_in(&recording, code).await?);
+                }
                 if cli.json {
-                    print_json(&t);
+                    // One language keeps the original object shape.
+                    match all.as_slice() {
+                        [one] => print_json(one),
+                        many => print_json(&many),
+                    }
                 } else {
-                    out!("{}", t.text);
+                    for t in &all {
+                        if all.len() > 1 {
+                            out!("# Language {}\n", t.language);
+                        }
+                        out!("{}", t.text);
+                    }
                 }
                 return Ok(());
             }
@@ -695,8 +713,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                match recap.save_transcript(&recording, &dir).await {
-                    Ok(paths) => saved.extend(paths),
+                match recap.save_transcripts(&recording, &dir, language).await {
+                    Ok(report) => {
+                        saved.extend(report.written);
+                        for (code, e) in report.failed {
+                            failed.push((format!("{id} (language {code})"), e));
+                        }
+                    }
                     Err(e @ canvas_core::Error::SessionExpired) => return Err(e.into()),
                     Err(canvas_core::Error::NotFound(_)) => missing.push(id),
                     Err(e) => failed.push((id, e.to_string())),
@@ -747,7 +770,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 );
                 let kinds: Vec<&str> = r.streams.iter().map(|s| s.kind.as_str()).collect();
                 out!("streams    {}", kinds.join(", "));
-                out!("captions   {}", if r.has_captions { "yes" } else { "no" });
+                if r.has_captions {
+                    let langs: Vec<String> =
+                        r.caption_languages.iter().map(i64::to_string).collect();
+                    out!(
+                        "captions   yes (languages: {})",
+                        if langs.is_empty() {
+                            "1".to_owned()
+                        } else {
+                            langs.join(", ")
+                        }
+                    );
+                } else {
+                    out!("captions   no");
+                }
                 for c in &r.chapters {
                     out!("  {:>5}m  {}", (c.start_secs / 60.0).floor(), c.title);
                 }

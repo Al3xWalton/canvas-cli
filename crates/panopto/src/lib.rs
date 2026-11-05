@@ -33,7 +33,7 @@ mod transcript;
 
 pub use course::{RecapTargets, recap_targets};
 pub use download::{DownloadOptions, Downloaded, file_stem};
-pub use transcript::{Cue, Transcript, parse_srt, to_text};
+pub use transcript::{Cue, Language, SaveReport, Transcript, languages, parse_srt, to_text};
 
 use canvas_auth::Session;
 use canvas_core::{Config, Error, Result};

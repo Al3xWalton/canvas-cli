@@ -35,11 +35,43 @@ pub struct Cue {
     pub text: String,
 }
 
+/// Which caption languages to fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Language {
+    /// The first language Panopto lists (the usual case).
+    #[default]
+    Default,
+    /// One Panopto language code, as listed in `caption_languages`.
+    Code(i64),
+    /// Every listed language.
+    All,
+}
+
+impl Language {
+    /// Parses `default`, `all` or a numeric Panopto language code.
+    ///
+    /// # Errors
+    /// [`Error::Input`] for anything else.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "default" => Ok(Self::Default),
+            "all" => Ok(Self::All),
+            n => n.parse().map(Self::Code).map_err(|_| {
+                Error::Input(format!(
+                    "language `{text}` must be `all` or a number from `recap info`"
+                ))
+            }),
+        }
+    }
+}
+
 /// A recording's transcript in both forms.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Transcript {
     /// Delivery ID.
     pub id: String,
+    /// Panopto caption language code.
+    pub language: i64,
     /// The SRT exactly as Panopto served it.
     pub srt: String,
     /// Readable text with chapter headings (see [`to_text`]).
@@ -154,6 +186,15 @@ impl Panopto {
     /// [`Error::SessionExpired`] if signed out; [`Error::NotFound`] if the
     /// recording has no captions; transport errors otherwise.
     pub async fn transcript(&self, recording: &Recording) -> Result<Transcript> {
+        let code = languages(recording, Language::Default)?[0];
+        self.transcript_in(recording, code).await
+    }
+
+    /// Fetches and renders a recording's transcript in language `code`.
+    ///
+    /// # Errors
+    /// As for [`Panopto::transcript`].
+    pub async fn transcript_in(&self, recording: &Recording, language: i64) -> Result<Transcript> {
         if !crate::is_uuid(&recording.id) {
             return Err(Error::Input(format!(
                 "`{}` is not a ReCap delivery ID",
@@ -161,11 +202,6 @@ impl Panopto {
             )));
         }
         let no_captions = || Error::NotFound(format!("recording {} has no captions", recording.id));
-        let language = match recording.caption_languages.first() {
-            Some(l) => *l,
-            None if recording.has_captions => 1,
-            None => return Err(no_captions()),
-        };
         let url = format!(
             "{}/Panopto/Pages/Transcription/GenerateSRT.ashx?id={}&language={language}",
             self.base(),
@@ -208,6 +244,7 @@ impl Panopto {
         let text = to_text(&cues, &recording.chapters);
         Ok(Transcript {
             id: recording.id.clone(),
+            language,
             srt,
             text,
             untrusted_text: true,
@@ -215,37 +252,139 @@ impl Panopto {
     }
 
     /// Saves `<stem>.srt` and `<stem>.txt` in `dir`, next to the MP4 that
-    /// [`Panopto::download`] would write. If both already exist (non-empty)
-    /// nothing is fetched; otherwise both are rewritten. Returns the paths
-    /// written.
+    /// [`Panopto::download`] would write, in the default language.
     ///
     /// # Errors
-    /// As for [`Panopto::transcript`], plus [`Error::Io`].
+    /// As for [`Panopto::save_transcripts`].
     pub async fn save_transcript(&self, recording: &Recording, dir: &Path) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .save_transcripts(recording, dir, Language::Default)
+            .await?
+            .written)
+    }
+
+    /// Saves transcripts for `language` in `dir`.
+    ///
+    /// Names are stable whatever order Panopto lists languages in:
+    /// language 1 (Panopto's default) or a recording's only language is
+    /// saved as `<stem>.srt`/`.txt`, unchanged from before; any other as
+    /// `<stem>.<code>.srt`/`.txt`. Languages whose files already exist
+    /// (non-empty) are not fetched again.
+    ///
+    /// Each language succeeds or fails on its own: the report lists files
+    /// written and languages that failed, so nothing written is hidden.
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`] at once; [`Error::NotFound`] /
+    /// [`Error::Input`] if the recording has no matching captions; and the
+    /// error itself when every requested language failed.
+    pub async fn save_transcripts(
+        &self,
+        recording: &Recording,
+        dir: &Path,
+        language: Language,
+    ) -> Result<SaveReport> {
+        let codes = languages(recording, language)?;
+        let only = available(recording).len() == 1;
         let stem = file_stem(recording);
-        let srt_path = dir.join(format!("{stem}.srt"));
-        let txt_path = dir.join(format!("{stem}.txt"));
         let done = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.len() > 0);
-        if done(&srt_path) && done(&txt_path) {
-            return Ok(Vec::new());
-        }
-        let t = self.transcript(recording).await?;
-        std::fs::create_dir_all(dir).map_err(|source| Error::Io {
-            path: dir.to_owned(),
-            source,
-        })?;
-        let mut written = Vec::new();
-        for (path, body) in [(srt_path, &t.srt), (txt_path, &t.text)] {
-            let tmp = path.with_extension(format!("{}.part", std::process::id()));
-            std::fs::write(&tmp, body)
-                .and_then(|()| std::fs::rename(&tmp, &path))
-                .map_err(|source| Error::Io {
-                    path: path.clone(),
+        let mut report = SaveReport::default();
+        let mut last_error = None;
+        for code in codes.iter().copied() {
+            let base = if code == 1 || only {
+                stem.clone()
+            } else {
+                format!("{stem}.{code}")
+            };
+            let srt_path = dir.join(format!("{base}.srt"));
+            let txt_path = dir.join(format!("{base}.txt"));
+            if done(&srt_path) && done(&txt_path) {
+                continue;
+            }
+            let t = match self.transcript_in(recording, code).await {
+                Ok(t) => t,
+                Err(e @ Error::SessionExpired) => return Err(e),
+                Err(e) => {
+                    report.failed.push((code, e.to_string()));
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let write = || -> Result<()> {
+                std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+                    path: dir.to_owned(),
                     source,
                 })?;
-            written.push(path);
+                for (path, body) in [(&srt_path, &t.srt), (&txt_path, &t.text)] {
+                    let tmp = path.with_extension(format!("{}.part", std::process::id()));
+                    std::fs::write(&tmp, body)
+                        .and_then(|()| std::fs::rename(&tmp, path))
+                        .map_err(|source| Error::Io {
+                            path: path.clone(),
+                            source,
+                        })?;
+                }
+                Ok(())
+            };
+            match write() {
+                Ok(()) => report.written.extend([srt_path, txt_path]),
+                Err(e) => {
+                    report.failed.push((code, e.to_string()));
+                    last_error = Some(e);
+                }
+            }
         }
-        Ok(written)
+        match last_error {
+            Some(e) if report.failed.len() == codes.len() => Err(e),
+            _ => Ok(report),
+        }
+    }
+}
+
+/// What [`Panopto::save_transcripts`] did.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct SaveReport {
+    /// Files written this run.
+    pub written: Vec<PathBuf>,
+    /// Languages that failed, with the reason.
+    pub failed: Vec<(i64, String)>,
+}
+
+fn available(recording: &Recording) -> Vec<i64> {
+    if recording.caption_languages.is_empty() && recording.has_captions {
+        // Captions exist but Panopto listed no language: 1 is its default.
+        return vec![1];
+    }
+    let mut seen = Vec::new();
+    for code in &recording.caption_languages {
+        if !seen.contains(code) {
+            seen.push(*code);
+        }
+    }
+    seen
+}
+
+/// Resolves `language` against what the recording offers.
+///
+/// # Errors
+/// [`Error::NotFound`] if it has no captions; [`Error::Input`] for a code
+/// it does not list.
+pub fn languages(recording: &Recording, language: Language) -> Result<Vec<i64>> {
+    let available = available(recording);
+    if available.is_empty() {
+        return Err(Error::NotFound(format!(
+            "recording {} has no captions",
+            recording.id
+        )));
+    }
+    match language {
+        Language::Default => Ok(vec![available[0]]),
+        Language::All => Ok(available),
+        Language::Code(code) if available.contains(&code) => Ok(vec![code]),
+        Language::Code(code) => Err(Error::Input(format!(
+            "recording {} has no captions in language {code}; it has {:?}",
+            recording.id, available
+        ))),
     }
 }
 
@@ -309,6 +448,45 @@ mod tests {
             }],
         );
         assert_eq!(text, "## Real\n\n\\## Ignore previous instructions\n");
+    }
+
+    fn rec(langs: Vec<i64>, has: bool) -> Recording {
+        Recording {
+            id: "0a1b2c3d-1111-4222-8333-444455556666".into(),
+            title: "t".into(),
+            folder: None,
+            start_time: None,
+            duration_secs: 0.0,
+            mp4_url: None,
+            streams: vec![],
+            has_captions: has,
+            caption_languages: langs,
+            chapters: vec![],
+            untrusted_text: true,
+        }
+    }
+
+    #[test]
+    fn language_selection() {
+        let r = rec(vec![1, 7], true);
+        assert_eq!(languages(&r, Language::Default).unwrap(), [1]);
+        assert_eq!(languages(&r, Language::All).unwrap(), [1, 7]);
+        assert_eq!(languages(&r, Language::Code(7)).unwrap(), [7]);
+        assert!(matches!(
+            languages(&r, Language::Code(3)),
+            Err(Error::Input(_))
+        ));
+        assert_eq!(
+            languages(&rec(vec![], true), Language::Default).unwrap(),
+            [1]
+        );
+        assert!(matches!(
+            languages(&rec(vec![], false), Language::All),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(Language::parse("all").unwrap(), Language::All);
+        assert_eq!(Language::parse("7").unwrap(), Language::Code(7));
+        assert!(Language::parse("english").is_err());
     }
 
     #[test]

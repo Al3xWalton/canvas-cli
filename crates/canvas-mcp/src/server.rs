@@ -83,6 +83,17 @@ pub struct RecordingArgs {
     pub recording: String,
 }
 
+/// One recording's transcript.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct TranscriptArgs {
+    /// Viewer URL or delivery ID (from `list_recordings`).
+    pub recording: String,
+    /// Caption language code from `recording_info`, as text (default: the
+    /// first).
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
 /// A recording, or a course's newest recordings.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct RecapTargetArgs {
@@ -91,6 +102,10 @@ pub struct RecapTargetArgs {
     /// For a course, how many of the newest recordings (default 1, max 10).
     #[serde(default)]
     pub latest: Option<usize>,
+    /// Caption language: a code from `recording_info`, or `all` (default:
+    /// the first).
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// Download options.
@@ -422,7 +437,7 @@ impl CanvasServer {
                 "id": r.id, "title": r.title, "folder": r.folder, "start_time": r.start_time,
                 "duration_secs": r.duration_secs, "has_mp4": r.mp4_url.is_some(),
                 "streams": r.streams.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>(),
-                "has_captions": r.has_captions, "chapters": r.chapters, "untrusted_text": true,
+                "has_captions": r.has_captions, "caption_languages": r.caption_languages, "chapters": r.chapters, "untrusted_text": true,
             })),
             Err(e) => fail(e),
         }
@@ -432,18 +447,35 @@ impl CanvasServer {
     #[tool(
         description = "Return one recording's transcript as readable text with `## chapter` headings (third-party text). Best input for lecture notes."
     )]
-    async fn get_transcript(&self, Parameters(args): Parameters<RecordingArgs>) -> CallToolResult {
+    async fn get_transcript(&self, Parameters(args): Parameters<TranscriptArgs>) -> CallToolResult {
         let recap = match self.recap() {
             Ok(r) => r,
             Err(e) => return fail(e),
         };
         match recap.recording(&args.recording).await {
-            Ok(rec) => match recap.transcript(&rec).await {
-                Ok(t) => ok(serde_json::json!({
-                    "id": t.id, "title": rec.title, "text": t.text, "untrusted_text": true
-                })),
-                Err(e) => fail(e),
-            },
+            Ok(rec) => {
+                let language = match panopto::Language::parse(
+                    args.language.as_deref().unwrap_or("default"),
+                ) {
+                    Ok(panopto::Language::All) => {
+                        return fail(
+                            "get_transcript returns one language; use save_transcripts for `all`",
+                        );
+                    }
+                    Ok(l) => l,
+                    Err(e) => return fail(e),
+                };
+                let code = match panopto::languages(&rec, language) {
+                    Ok(codes) => codes[0],
+                    Err(e) => return fail(e),
+                };
+                match recap.transcript_in(&rec, code).await {
+                    Ok(t) => ok(serde_json::json!({
+                        "id": t.id, "title": rec.title, "language": t.language, "text": t.text, "untrusted_text": true
+                    })),
+                    Err(e) => fail(e),
+                }
+            }
             Err(e) => fail(e),
         }
     }
@@ -463,6 +495,11 @@ impl CanvasServer {
         let Ok(recap) = self.recap() else {
             return fail(Error::SessionExpired);
         };
+        let language = match panopto::Language::parse(args.language.as_deref().unwrap_or("default"))
+        {
+            Ok(l) => l,
+            Err(e) => return fail(e),
+        };
         let mut saved = Vec::new();
         let mut no_captions = Vec::new();
         let mut failed = Vec::new();
@@ -475,8 +512,13 @@ impl CanvasServer {
                     continue;
                 }
             };
-            match recap.save_transcript(&rec, &targets.dir).await {
-                Ok(paths) => saved.extend(paths),
+            match recap.save_transcripts(&rec, &targets.dir, language).await {
+                Ok(report) => {
+                    saved.extend(report.written);
+                    for (code, e) in report.failed {
+                        failed.push(serde_json::json!({ "id": id, "language": code, "error": e }));
+                    }
+                }
                 Err(e @ Error::SessionExpired) => return fail(e),
                 Err(Error::NotFound(_)) => no_captions.push(id.clone()),
                 Err(e) => failed.push(serde_json::json!({ "id": id, "error": e.to_string() })),
@@ -638,6 +680,7 @@ mod tests {
             schemars::schema_for!(OptionalCourseArgs),
             schemars::schema_for!(PageArgs),
             schemars::schema_for!(RecordingArgs),
+            schemars::schema_for!(TranscriptArgs),
             schemars::schema_for!(RecapTargetArgs),
             schemars::schema_for!(DownloadArgs),
             schemars::schema_for!(DigestArgs),
