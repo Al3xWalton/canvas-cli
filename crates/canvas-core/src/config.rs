@@ -35,11 +35,15 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Returns the default config file path for this user.
+    /// Returns the config file path: `$CANVAS_CLI_CONFIG` if set, otherwise
+    /// `~/.config/canvas-cli/config.toml`.
     ///
     /// # Errors
     /// Returns [`Error::NoConfigDir`] if the user has no home directory.
     pub fn default_path() -> Result<PathBuf> {
+        if let Some(path) = std::env::var_os("CANVAS_CLI_CONFIG") {
+            return Ok(PathBuf::from(path));
+        }
         dirs::home_dir()
             .map(|h| h.join(".config/canvas-cli/config.toml"))
             .ok_or(Error::NoConfigDir)

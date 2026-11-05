@@ -32,6 +32,9 @@ enum Command {
     Auth(AuthCommand),
     /// Show the active config file and settings.
     Config,
+    /// Connect canvas-mcp to an agent client.
+    #[command(subcommand)]
+    Mcp(McpCommand),
     /// List your active courses.
     Courses,
     /// List assignments due soon across your courses.
@@ -61,6 +64,28 @@ enum AuthCommand {
     Status,
     /// Delete the stored session from the keychain.
     Logout,
+}
+
+/// `canvas mcp ...`
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Print the command or config that adds canvas-mcp to a client.
+    Install {
+        /// Which client to set up.
+        #[arg(long, value_enum)]
+        client: McpClient,
+    },
+}
+
+/// MCP clients `canvas mcp install` knows about.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum McpClient {
+    /// Claude Code.
+    Claude,
+    /// OpenAI Codex CLI.
+    Codex,
+    /// Cursor, or any client that reads `mcpServers` JSON.
+    Cursor,
 }
 
 /// What `canvas auth status` reports.
@@ -153,6 +178,36 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Mcp(McpCommand::Install { client }) => {
+            let path = std::env::current_exe()?.with_file_name("canvas-mcp");
+            if !path.exists() {
+                eprintln!(
+                    "warning: {} does not exist yet; run `make install` first",
+                    path.display()
+                );
+            }
+            let bin = path.display().to_string();
+            // JSON string escaping is also valid as a TOML basic string.
+            let quoted = serde_json::to_string(&bin)?;
+            match client {
+                McpClient::Claude => {
+                    println!(
+                        "claude mcp add --scope user canvas -- {}",
+                        shell_quote(&bin)
+                    )
+                }
+                McpClient::Codex => {
+                    println!(
+                        "Add to ~/.codex/config.toml:\n\n[mcp_servers.canvas]\ncommand = {quoted}"
+                    )
+                }
+                McpClient::Cursor => println!(
+                    "Add to ~/.cursor/mcp.json:\n\n{}",
+                    serde_json::json!({ "mcpServers": { "canvas": { "command": bin } } })
+                ),
+            }
+            eprintln!("canvas-mcp runs on the session from `canvas auth login`.");
+        }
         Command::Courses => {
             let courses = client(&config)?.courses().await?;
             if cli.json {
@@ -207,6 +262,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Quotes `text` for a POSIX shell: wraps it in single quotes and escapes
+/// any single quote inside.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// Builds an API client from the stored session.
 fn client(config: &Config) -> anyhow::Result<canvas_api::Client> {
     let session = canvas_auth::load()?;
@@ -241,4 +302,16 @@ fn ago(t: u64) -> String {
 
 fn until(t: u64) -> String {
     human(t.saturating_sub(now()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_survives_spaces_dollars_and_quotes() {
+        assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(shell_quote("/x$y`z"), "'/x$y`z'");
+        assert_eq!(shell_quote("/it's"), r"'/it'\''s'");
+    }
 }

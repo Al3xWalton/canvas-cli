@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 const SERVICE: &str = "canvas-cli";
 /// Keychain account name for the stored session.
 const ACCOUNT: &str = "browser-session";
+/// Overrides [`ACCOUNT`], so tests and second profiles never touch the
+/// user's real session.
+const ACCOUNT_ENV: &str = "CANVAS_CLI_KEYCHAIN_ACCOUNT";
 
 /// One cookie captured from the sign-in browser.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -110,7 +113,8 @@ impl Session {
 }
 
 fn entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| Error::Keychain(e.to_string()))
+    let account = std::env::var(ACCOUNT_ENV).unwrap_or_else(|_| ACCOUNT.to_owned());
+    keyring::Entry::new(SERVICE, &account).map_err(|e| Error::Keychain(e.to_string()))
 }
 
 /// Saves `session` to the OS keychain, replacing any earlier one.

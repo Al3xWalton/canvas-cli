@@ -17,6 +17,10 @@
 //! [`canvas_core::Error::SessionExpired`], whose message tells the user to
 //! run `canvas auth login`.
 //!
+//! The keychain entry is `canvas-cli` / `browser-session`. Setting
+//! `CANVAS_CLI_KEYCHAIN_ACCOUNT` selects another account name, which tests
+//! use so they never read the real session.
+//!
 //! A session cookie is as powerful as the user's password. Treat a
 //! [`Session`] that way: it deliberately has no `Display`, and its `Debug`
 //! output redacts every cookie value.

@@ -46,6 +46,10 @@ impl Client {
             // A redirect from the API means "go and log in"; we report that
             // instead of following it to an HTML page.
             .redirect(redirect::Policy::none())
+            // An unanswered request must fail, not hang: the MCP server
+            // checks the session before its handshake.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(Self {
