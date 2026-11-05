@@ -140,6 +140,11 @@ enum AuthCommand {
 /// `canvas recap ...`
 #[derive(Debug, Subcommand)]
 enum RecapCommand {
+    /// List a course's recordings, newest first.
+    List {
+        /// Course id, code (e.g. ABC1016) or part of the name.
+        course: String,
+    },
     /// Show a recording's details and streams.
     Info {
         /// Viewer or embed URL, or the delivery ID.
@@ -410,6 +415,44 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             out!("{score:>10}  {}", g.name);
                         }
                     }
+                }
+            }
+        }
+        Command::Recap(RecapCommand::List { course }) => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let code = course
+                .course_code
+                .as_deref()
+                .and_then(panopto::module_code)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "course {} has no module code to find its ReCap folder",
+                        course.id
+                    )
+                })?;
+            let session = canvas_auth::load()?;
+            let recap = panopto::Panopto::new(&config, &session)?;
+            let term = course.term.as_ref().map(|t| t.name.as_str());
+            let result = recap.course_recordings(&code, term).await?;
+            if cli.json {
+                print_json(&result);
+            } else {
+                if let Some(w) = &result.warning {
+                    eprintln!("warning: {w}");
+                }
+                if result.recordings.is_empty() {
+                    out!("No recordings yet.");
+                }
+                for r in &result.recordings {
+                    let when = r.start_time.map(local_time).unwrap_or_default();
+                    let cc = if r.has_captions { "cc" } else { "  " };
+                    out!(
+                        "{when:<17} {:>4}m {cc}  {}  {}",
+                        (r.duration_secs / 60.0).round(),
+                        r.id,
+                        r.title
+                    );
                 }
             }
         }

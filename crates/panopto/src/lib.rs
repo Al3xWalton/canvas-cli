@@ -19,6 +19,11 @@
 //! ([`canvas_core::Error::SessionExpired`]); code 5 means the link is
 //! invalid ([`canvas_core::Error::NotFound`]).
 //!
+//! Recordings for a course are found through the web UI's own data
+//! service: [`Panopto::course_recordings`] searches folders for the course
+//! code (`/Panopto/Services/Data.svc/GetFolders`), then lists each matching
+//! folder's sessions (`GetSessions`).
+//!
 //! The protocol was learned by studying the GPL-3.0
 //! `travbend/panopto-downloader` extension; no code was copied from it.
 
@@ -156,6 +161,149 @@ struct RawChapter {
 /// Seconds between 1601-01-01 (the Windows epoch Panopto counts
 /// `SessionStartTime` from) and 1970-01-01.
 const WINDOWS_TO_UNIX_SECS: f64 = 11_644_473_600.0;
+
+/// A recording as listed in a folder, before its streams are resolved.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecordingSummary {
+    /// Delivery ID; pass to [`Panopto::recording`] or a download.
+    pub id: String,
+    /// Session title. Third-party text.
+    pub title: String,
+    /// Folder name. Third-party text.
+    pub folder: String,
+    /// When it was recorded.
+    pub start_time: Option<DateTime<Utc>>,
+    /// Length in seconds.
+    pub duration_secs: f64,
+    /// Whether captions exist.
+    pub has_captions: bool,
+    /// Always true: `title` and `folder` are third-party text.
+    pub untrusted_text: bool,
+}
+
+/// A Panopto folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Folder {
+    /// Folder ID.
+    pub id: String,
+    /// Folder name, e.g. `2026/27 - Example Studies - ABC1020`.
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+struct DataEnvelope<T> {
+    d: T,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ResultPage<T> {
+    #[serde(default = "none")]
+    results: Option<Vec<T>>,
+    #[serde(default, deserialize_with = "null_default")]
+    total_number: u64,
+}
+
+#[derive(Deserialize)]
+struct RawFolder {
+    #[serde(rename = "ID", default)]
+    id: Option<String>,
+    #[serde(rename = "Name", default, deserialize_with = "null_default")]
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawSession {
+    #[serde(rename = "DeliveryID", default)]
+    delivery_id: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    session_name: String,
+    #[serde(default, deserialize_with = "null_default")]
+    folder_name: String,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    duration: f64,
+    #[serde(default, deserialize_with = "null_default")]
+    has_captions: bool,
+}
+
+fn none<T>() -> Option<T> {
+    None
+}
+
+/// Rows requested per data-service page.
+const PAGE_SIZE: u64 = 100;
+/// Pages fetched per listing before giving up.
+const MAX_SESSION_PAGES: u64 = 50;
+
+/// Removes HTML tags (Panopto wraps search hits in `<span class="match">`)
+/// and control characters, and collapses whitespace.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        // Only `<` followed by a letter or `/` opens a tag, so text such as
+        // `Costs < Revenue` survives.
+        if c == '<'
+            && chars
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphabetic() || *n == '/')
+        {
+            for t in chars.by_ref() {
+                if t == '>' {
+                    break;
+                }
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Parses Microsoft JSON dates like `/Date(1793284500325)/`.
+fn ms_date(text: &str) -> Option<DateTime<Utc>> {
+    let inner = text.strip_prefix("/Date(")?.strip_suffix(")/")?;
+    // `ms` may be negative; an optional `+hhmm`/`-hhmm` offset follows but
+    // does not change the UTC instant.
+    let (sign, rest) = match inner.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, inner),
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    DateTime::from_timestamp_millis(sign * digits.parse::<i64>().ok()?)
+}
+
+/// Returns the module code at the start of a Canvas course code, e.g.
+/// `ABC1016` from `ABC1016 (26/27)` or `ABC1000` from
+/// `ABC1000-ABC1003 (26/27)`.
+///
+/// # Example
+/// ```
+/// assert_eq!(panopto::module_code("ABC1020 (26/27)").as_deref(), Some("ABC1020"));
+/// assert_eq!(panopto::module_code("AI for Learning"), None);
+/// ```
+pub fn module_code(course_code: &str) -> Option<String> {
+    let first: String = course_code
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let letters = first
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
+    let digits = first.len() - letters;
+    (letters >= 2 && digits >= 3).then(|| first.to_ascii_uppercase())
+}
 
 /// Extracts a delivery ID from a bare UUID or any Panopto URL with an
 /// `id=` query parameter.
@@ -296,6 +444,229 @@ impl Panopto {
     }
 }
 
+impl Panopto {
+    async fn data<B: Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        body: &B,
+    ) -> Result<T> {
+        let mut request = self
+            .http
+            .post(format!(
+                "{}/Panopto/Services/Data.svc/{method}",
+                self.base()
+            ))
+            .header(header::COOKIE, &self.cookie)
+            .json(body);
+        if let Some(csrf) = &self.csrf {
+            request = request.header("X-Csrf-Token", csrf);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        let status = response.status();
+        if status.is_redirection() || status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Error::SessionExpired);
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::Forbidden(format!("ReCap {method}")));
+        }
+        if !status.is_success() {
+            return Err(Error::Http(format!("ReCap {method} returned {status}")));
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        // A login page or a null payload means the session is gone.
+        if text.trim_start().starts_with('<') {
+            return Err(Error::SessionExpired);
+        }
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| Error::Decode {
+            what: format!("ReCap {method}"),
+            detail: e.to_string(),
+        })?;
+        if value.get("d").is_none_or(serde_json::Value::is_null) {
+            return Err(Error::SessionExpired);
+        }
+        serde_json::from_value::<DataEnvelope<T>>(value)
+            .map(|e| e.d)
+            .map_err(|e| Error::Decode {
+                what: format!("ReCap {method}"),
+                detail: e.to_string(),
+            })
+    }
+
+    /// Confirms the Panopto session is signed in.
+    ///
+    /// The data service answers a signed-out user with empty results, not
+    /// an error, so every listing checks this first. It asks DeliveryInfo
+    /// about the all-zero ID: signed-out users get code 2, signed-in users
+    /// get code 5 ("link invalid").
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`] if signed out; transport errors otherwise.
+    pub async fn check_session(&self) -> Result<()> {
+        match self.recording("00000000-0000-0000-0000-000000000000").await {
+            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Searches folders the user can see by name.
+    ///
+    /// # Errors
+    /// As for [`Panopto::recording`].
+    pub async fn folders(&self, query: &str) -> Result<Vec<Folder>> {
+        let mut out = Vec::new();
+        for page in 0..MAX_SESSION_PAGES {
+            let body = serde_json::json!({ "queryParameters": {
+                "query": query, "sortColumn": 1, "sortAscending": true,
+                "maxResults": PAGE_SIZE, "page": page
+            }});
+            let result: ResultPage<RawFolder> = self.data("GetFolders", &body).await?;
+            let rows = result.results.unwrap_or_default();
+            let raw = rows.len() as u64;
+            out.extend(rows.into_iter().filter_map(|f| {
+                Some(Folder {
+                    id: f.id.filter(|id| is_uuid(id))?,
+                    name: plain(&f.name),
+                })
+            }));
+            if raw < PAGE_SIZE {
+                return Ok(out);
+            }
+        }
+        Err(Error::Http(format!(
+            "ReCap folder search for `{query}` has too many pages"
+        )))
+    }
+
+    /// Lists every recording in a folder, newest first.
+    ///
+    /// # Errors
+    /// As for [`Panopto::recording`]; [`Error::Input`] for a bad folder ID.
+    pub async fn folder_recordings(&self, folder_id: &str) -> Result<Vec<RecordingSummary>> {
+        if !is_uuid(folder_id) {
+            return Err(Error::Input(format!(
+                "`{folder_id}` is not a ReCap folder ID"
+            )));
+        }
+        let mut out = Vec::new();
+        let mut seen = 0u64;
+        for page in 0..MAX_SESSION_PAGES {
+            let body = serde_json::json!({ "queryParameters": {
+                "query": null, "sortColumn": 1, "sortAscending": false, "maxResults": PAGE_SIZE,
+                "page": page, "folderID": folder_id, "getFolderData": false,
+                "includeArchived": true, "includePlaylists": false
+            }});
+            let result: ResultPage<RawSession> = self.data("GetSessions", &body).await?;
+            let rows = result.results.unwrap_or_default();
+            let raw = rows.len() as u64;
+            seen += raw;
+            out.extend(rows.into_iter().filter_map(|s| {
+                Some(RecordingSummary {
+                    id: s.delivery_id.filter(|id| is_uuid(id))?.to_lowercase(),
+                    title: plain(&s.session_name),
+                    folder: plain(&s.folder_name),
+                    start_time: s.start_time.as_deref().and_then(ms_date),
+                    duration_secs: s.duration,
+                    has_captions: s.has_captions,
+                    untrusted_text: true,
+                })
+            }));
+            // Count raw rows, not kept ones, and stop on a short page, so a
+            // missing total or a filtered row never cuts or extends paging.
+            if raw < PAGE_SIZE || (result.total_number > 0 && seen >= result.total_number) {
+                return Ok(out);
+            }
+        }
+        Err(Error::Http(format!(
+            "ReCap folder {folder_id} has more than {} pages",
+            MAX_SESSION_PAGES
+        )))
+    }
+
+    /// Lists every recording in the folders named for `module_code`
+    /// (e.g. `ABC1016`), newest first.
+    ///
+    /// A folder matches when its name contains the code as a whole word
+    /// (so `ABC1016` never matches `ABC10160`). If `term` (e.g. `2026/27`)
+    /// matches some folders, only those are used; if it matches none, all
+    /// years are used and [`CourseRecordings::warning`] says so.
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`] if the Panopto session is signed out
+    /// (checked first, since the data service hides that); otherwise as
+    /// for [`Panopto::folder_recordings`], and [`Error::NotFound`] if no
+    /// folder matches.
+    pub async fn course_recordings(
+        &self,
+        module_code: &str,
+        term: Option<&str>,
+    ) -> Result<CourseRecordings> {
+        self.check_session().await?;
+        let code = module_code.to_ascii_uppercase();
+        let mut folders: Vec<Folder> = self
+            .folders(&code)
+            .await?
+            .into_iter()
+            .filter(|f| contains_word(&f.name.to_ascii_uppercase(), &code))
+            .collect();
+        let mut warning = None;
+        match term {
+            Some(term) if folders.iter().any(|f| f.name.contains(term)) => {
+                folders.retain(|f| f.name.contains(term));
+            }
+            Some(term) if !folders.is_empty() => {
+                warning = Some(format!("no {code} folder for {term}; showing every year"));
+            }
+            _ => {}
+        }
+        if folders.is_empty() {
+            return Err(Error::NotFound(format!("no ReCap folder for {code}")));
+        }
+        let mut recordings = Vec::new();
+        for folder in &folders {
+            recordings.extend(self.folder_recordings(&folder.id).await?);
+        }
+        recordings.sort_by(|a, b| {
+            b.start_time
+                .cmp(&a.start_time)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        recordings.dedup_by(|a, b| a.id == b.id);
+        Ok(CourseRecordings {
+            folders,
+            recordings,
+            warning,
+        })
+    }
+}
+
+/// The result of [`Panopto::course_recordings`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CourseRecordings {
+    /// Folders the recordings came from.
+    pub folders: Vec<Folder>,
+    /// Recordings, newest first.
+    pub recordings: Vec<RecordingSummary>,
+    /// Set when the result is broader than asked, e.g. every year.
+    pub warning: Option<String>,
+}
+
+/// True if `needle` occurs in `haystack` with no letter or digit directly
+/// before or after it.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(i, _)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + needle.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 fn parse(id: &str, text: &str) -> Result<Recording> {
     let envelope: Envelope = serde_json::from_str(text).map_err(|e| Error::Decode {
         what: "ReCap DeliveryInfo".into(),
@@ -378,6 +749,68 @@ mod tests {
     use super::*;
 
     const ID: &str = "0a1b2c3d-1111-4222-8333-444455556666";
+
+    #[test]
+    fn plain_strips_highlight_tags() {
+        assert_eq!(
+            plain(r#"2026/27 - Skills - <span class="match">ABC</span>1016 "#),
+            "2026/27 - Skills - ABC1016"
+        );
+    }
+
+    #[test]
+    fn plain_keeps_lone_angle_brackets_and_decodes_entities() {
+        assert_eq!(
+            plain("Costs < Revenue &amp; Profit"),
+            "Costs < Revenue & Profit"
+        );
+        assert_eq!(plain("a <b>bold</b> c"), "a bold c");
+    }
+
+    #[test]
+    fn codes_match_as_whole_words() {
+        assert!(contains_word("2026/27 - SKILLS - ABC1016", "ABC1016"));
+        assert!(!contains_word("2026/27 - X - ABC10160", "ABC1016"));
+        assert!(!contains_word("XABC1016", "ABC1016"));
+    }
+
+    #[test]
+    fn ms_dates_parse() {
+        assert!(ms_date("/Date(1793284500325-0500)/").is_some());
+        assert_eq!(ms_date("/Date(-1000)/").unwrap().timestamp(), -1);
+        assert_eq!(
+            ms_date("/Date(1793284500325)/").unwrap().to_rfc3339(),
+            "2026-10-29T14:35:00.325+00:00"
+        );
+        assert_eq!(
+            ms_date("/Date(1793284500325+0000)/").unwrap().timestamp(),
+            1_793_284_500
+        );
+        assert!(ms_date("2026-10-29").is_none());
+    }
+
+    #[test]
+    fn module_codes_come_from_canvas_codes() {
+        assert_eq!(
+            module_code("ABC1000-ABC1003 (26/27)").as_deref(),
+            Some("ABC1000")
+        );
+        assert_eq!(
+            module_code("ABC1997-ABC2997-ABC3997 (26/27)").as_deref(),
+            Some("ABC1997")
+        );
+        assert_eq!(module_code("2026-Student Induction"), None);
+    }
+
+    #[test]
+    fn session_rows_parse_with_nulls() {
+        let page: ResultPage<RawSession> = serde_json::from_str(
+            r#"{"Results":[{"DeliveryID":"0A1B2C3D-1111-4222-8333-444455556666","SessionName":"<span>L1</span>","FolderName":null,"StartTime":"/Date(1793284500325)/","Duration":null,"HasCaptions":true},{"DeliveryID":"bad"}],"TotalNumber":2}"#,
+        )
+        .unwrap();
+        assert_eq!(page.results.unwrap().len(), 2);
+        assert_eq!(page.total_number, 2);
+    }
 
     #[test]
     fn delivery_id_accepts_urls_and_uuids() {
