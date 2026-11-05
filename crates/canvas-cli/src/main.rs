@@ -32,6 +32,17 @@ enum Command {
     Auth(AuthCommand),
     /// Show the active config file and settings.
     Config,
+    /// List your active courses.
+    Courses,
+    /// List assignments due soon across your courses.
+    Assignments {
+        /// How far ahead to look: a number with m, h, d or w.
+        #[arg(long, default_value = "7d", value_parser = canvas_api::parse_window)]
+        due: chrono::Duration,
+        /// Only this course id.
+        #[arg(long)]
+        course: Option<u64>,
+    },
 }
 
 /// `canvas auth ...`
@@ -142,6 +153,48 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Courses => {
+            let courses = client(&config)?.courses().await?;
+            if cli.json {
+                print_json(&courses);
+            } else {
+                for c in &courses {
+                    let code = c.course_code.as_deref().unwrap_or("");
+                    println!("{:<8} {:<26} {}", c.id, code, c.name);
+                }
+            }
+        }
+        Command::Assignments { due, course } => {
+            let list = canvas_api::upcoming_assignments(
+                &client(&config)?,
+                due,
+                chrono::Utc::now(),
+                course,
+            )
+            .await?;
+            if cli.json {
+                print_json(&list);
+            } else if list.is_empty() {
+                println!("Nothing due.");
+            } else {
+                for u in &list {
+                    let when = u
+                        .assignment
+                        .due_at
+                        .map(|d| {
+                            d.with_timezone(&chrono::Local)
+                                .format("%a %d %b %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    let done = if u.submitted { "submitted" } else { "" };
+                    println!(
+                        "{when:<17} {:<22} {:<10} {}",
+                        u.course, done, u.assignment.name
+                    );
+                }
+            }
+        }
         Command::Auth(AuthCommand::Logout) => {
             canvas_auth::delete()?;
             if cli.json {
@@ -152,6 +205,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Builds an API client from the stored session.
+fn client(config: &Config) -> anyhow::Result<canvas_api::Client> {
+    let session = canvas_auth::load()?;
+    Ok(canvas_api::Client::new(config, &session)?)
 }
 
 fn print_json(value: &impl Serialize) {

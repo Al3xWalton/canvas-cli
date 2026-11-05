@@ -21,6 +21,7 @@ canvas-auth.workspace = true
 canvas-api.workspace = true
 tokio.workspace = true
 serde.workspace = true
+chrono.workspace = true
 url.workspace = true
 
 [lints]
