@@ -1,0 +1,21 @@
+[package]
+name = "canvas-mcp"
+description = "MCP server that gives agents Canvas CLI's tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "canvas-mcp"
+path = "src/main.rs"
+
+[dependencies]
+canvas-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

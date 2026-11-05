@@ -1,0 +1,15 @@
+[package]
+name = "canvas-auth"
+description = "Browser-session sign-in for Canvas and Panopto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+canvas-core.workspace = true
+
+[lints]
+workspace = true
