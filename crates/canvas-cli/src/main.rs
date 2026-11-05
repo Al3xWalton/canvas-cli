@@ -16,12 +16,21 @@ use serde::Serialize;
 
 /// Writes a line to stdout. If stdout is closed (e.g. piped into `head`),
 /// exits quietly instead of panicking.
+/// Canvas text is third-party, so control characters (terminal escape
+/// codes) are removed; newlines and tabs are kept.
 macro_rules! out {
     ($($arg:tt)*) => {
-        if writeln!(std::io::stdout(), $($arg)*).is_err() {
+        if writeln!(std::io::stdout(), "{}", clean(&format!($($arg)*))).is_err() {
             std::process::exit(0);
         }
     };
+}
+
+/// Removes control characters other than newline and tab.
+fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
 }
 
 /// Read Canvas, download course files and ReCap lectures.
@@ -76,6 +85,25 @@ enum Command {
         since: chrono::Duration,
         /// Only this course: an id, code or part of the name.
         #[arg(long)]
+        course: Option<String>,
+    },
+    /// List timetabled events and due dates (undated work is not shown).
+    Calendar {
+        /// How far ahead to look: a number with m, h, d or w.
+        #[arg(long, default_value = "7d", value_parser = canvas_api::parse_window)]
+        days: chrono::Duration,
+        /// Only this course: an id, code or part of the name.
+        #[arg(long)]
+        course: Option<String>,
+    },
+    /// List a course's quizzes (metadata only).
+    Quizzes {
+        /// Course id, code or part of the name.
+        course: String,
+    },
+    /// Show overall grades, or one course's assignment results.
+    Grades {
+        /// Course id, code or part of the name.
         course: Option<String>,
     },
     /// List a course's discussion topics.
@@ -274,6 +302,80 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Calendar { days, course } => {
+            let client = client(&config)?;
+            let ids: Vec<u64> = match course {
+                Some(text) => vec![canvas_api::resolve_course(&client, &text).await?.id],
+                None => client.courses().await?.iter().map(|c| c.id).collect(),
+            };
+            let now = chrono::Utc::now();
+            let events = client.calendar(&ids, now, now + days).await?;
+            if cli.json {
+                print_json(&events);
+            } else if events.is_empty() {
+                out!("Nothing on the calendar.");
+            } else {
+                for e in &events {
+                    let when = e.start_at.map(local_time).unwrap_or_default();
+                    let place = e.location_name.as_deref().unwrap_or("");
+                    out!("{when:<17} {:<10} {} {place}", e.kind, e.title);
+                }
+            }
+        }
+        Command::Quizzes { course } => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let quizzes = client.quizzes(course.id).await?;
+            if cli.json {
+                print_json(&quizzes);
+            } else if quizzes.is_empty() {
+                out!("No classic quizzes (New Quizzes appear under `assignments`).");
+            } else {
+                for q in &quizzes {
+                    let due = q
+                        .due_at
+                        .map(local_time)
+                        .unwrap_or_else(|| "no due date".into());
+                    out!("{due:<17} {}", q.title);
+                }
+            }
+        }
+        Command::Grades { course } => {
+            let client = client(&config)?;
+            match course {
+                None => {
+                    let grades = client.grades().await?;
+                    if cli.json {
+                        print_json(&grades);
+                    } else {
+                        for g in &grades {
+                            let score = match (g.hidden, g.current_score) {
+                                (true, _) => "hidden".to_owned(),
+                                (false, Some(s)) => format!("{s:.1}%"),
+                                (false, None) => "-".to_owned(),
+                            };
+                            out!("{score:>7}  {}", g.course);
+                        }
+                    }
+                }
+                Some(text) => {
+                    let course = canvas_api::resolve_course(&client, &text).await?;
+                    let grades = client.assignment_grades(course.id).await?;
+                    if cli.json {
+                        print_json(&grades);
+                    } else {
+                        for g in &grades {
+                            let score = match (g.score, g.points_possible) {
+                                (Some(s), Some(p)) => format!("{s}/{p}"),
+                                (Some(s), None) => s.to_string(),
+                                _ => "-".into(),
+                            };
+                            out!("{score:>10}  {}", g.name);
+                        }
+                    }
+                }
+            }
+        }
         Command::Discussions { course } => {
             let client = client(&config)?;
             let course = canvas_api::resolve_course(&client, &course).await?;
@@ -426,7 +528,12 @@ fn until(t: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::{clean, shell_quote};
+
+    #[test]
+    fn clean_strips_escape_codes_but_keeps_layout() {
+        assert_eq!(clean("a\u{1b}[31mred\u{7}\tb\nc"), "a[31mred\tb\nc");
+    }
 
     #[test]
     fn shell_quote_survives_spaces_dollars_and_quotes() {

@@ -19,12 +19,14 @@
 //! Both map to [`canvas_core::Error::SessionExpired`] so the caller can tell
 //! the user to run `canvas auth login`.
 
+mod academic;
 mod client;
 mod content;
 mod markdown;
 mod queries;
 mod types;
 
+pub use academic::{AssignmentGrade, CalendarEvent, CourseGrade, Quiz};
 pub use client::Client;
 pub use content::{Announcement, Discussion, Module, ModuleItem, Page, PageSummary};
 pub use markdown::html_to_markdown;
