@@ -29,10 +29,14 @@
 
 mod course;
 mod download;
+mod filing;
 mod transcript;
 
 pub use course::{RecapTargets, recap_targets};
-pub use download::{DownloadOptions, Downloaded, file_stem};
+pub use download::{DownloadOptions, Downloaded, file_stem, write_new};
+pub use filing::{
+    FilingPlan, LectureFolder, Pairing, plan_filing, scan_lecture_folders, title_score,
+};
 pub use transcript::{Cue, Language, SaveReport, Transcript, languages, parse_srt, to_text};
 
 use canvas_auth::Session;

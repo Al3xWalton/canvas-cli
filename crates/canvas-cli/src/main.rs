@@ -198,6 +198,25 @@ enum RecapCommand {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// File a course's recordings into your own `Lnn - Title` lecture
+    /// folders, oldest recording to L01. Shows the plan; writes only with
+    /// --apply.
+    File {
+        /// Course id, code (e.g. ABC1002) or part of the name.
+        course: String,
+        /// Folder holding the `L01 - ...`, `L02 - ...` lecture folders.
+        #[arg(long)]
+        into: std::path::PathBuf,
+        /// Also save `<folder name>.txt` and `.srt` transcripts.
+        #[arg(long)]
+        transcripts: bool,
+        /// Write files (otherwise only the plan is shown).
+        #[arg(long)]
+        apply: bool,
+        /// Also file pairs whose chapters do not match the folder title.
+        #[arg(long, requires = "apply")]
+        force: bool,
+    },
     /// Show a recording's details and streams.
     Info {
         /// Viewer or embed URL, or the delivery ID.
@@ -747,6 +766,158 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !failed.is_empty() {
                 anyhow::bail!("{} transcript(s) failed", failed.len());
+            }
+        }
+        Command::Recap(RecapCommand::File {
+            course,
+            into,
+            transcripts,
+            apply,
+            force,
+        }) => {
+            let client = client(&config)?;
+            let session = canvas_auth::load()?;
+            let recap = panopto::Panopto::new(&config, &session)?.with_persistence(true);
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let code = course
+                .course_code
+                .as_deref()
+                .and_then(panopto::module_code)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "course {} has no module code to find its ReCap folder",
+                        course.id
+                    )
+                })?;
+            let folders = panopto::scan_lecture_folders(&into)?;
+            if folders.is_empty() {
+                anyhow::bail!("no `L01 - ...` style folders in {}", into.display());
+            }
+            let found = recap
+                .course_recordings(&code, course.term.as_ref().map(|t| t.name.as_str()))
+                .await?;
+            if let Some(w) = &found.warning {
+                eprintln!("warning: {w}");
+            }
+            // Look each recording up once: chapters for scoring, URLs for
+            // downloading.
+            let mut details = std::collections::HashMap::new();
+            let mut chapters = std::collections::HashMap::new();
+            for r in &found.recordings {
+                let d = recap.recording(&r.id).await?;
+                chapters.insert(
+                    r.id.clone(),
+                    d.chapters
+                        .iter()
+                        .map(|c| c.title.clone())
+                        .collect::<Vec<_>>(),
+                );
+                details.insert(r.id.clone(), d);
+            }
+            let plan = panopto::plan_filing(folders, found.recordings, &chapters);
+            if cli.json && !apply {
+                print_json(&plan);
+                return Ok(());
+            }
+            for p in plan.pairs.iter().filter(|_| !cli.json) {
+                let when = p.recording.start_time.map(local_time).unwrap_or_default();
+                let check = match p.score {
+                    Some(s) if p.is_weak() => format!("CHECK (match {:.0}%)", s * 100.0),
+                    Some(s) => format!("match {:.0}%", s * 100.0),
+                    None => "not checkable (generic title or no chapters)".to_owned(),
+                };
+                out!(
+                    "{:<45} <- {when}  {:>3}m  {check}",
+                    p.folder.name,
+                    (p.recording.duration_secs / 60.0).round()
+                );
+            }
+            for f in plan.folders_without_recording.iter().filter(|_| !cli.json) {
+                out!("{:<45} <- no recording yet", f.name);
+            }
+            for r in plan.recordings_without_folder.iter().filter(|_| !cli.json) {
+                let when = r.start_time.map(local_time).unwrap_or_default();
+                out!("{:<45} <- {when}  (no folder for this recording)", "?");
+            }
+            if !apply {
+                out!("\nNothing written. Re-run with --apply to file these.");
+                return Ok(());
+            }
+            let tmp = config.download_root.join(".canvas-sync").join("tmp");
+            let mut written: Vec<std::path::PathBuf> = Vec::new();
+            let mut skipped = 0usize;
+            let mut failed: Vec<(String, String)> = Vec::new();
+            for p in &plan.pairs {
+                if p.is_weak() && !force {
+                    out!(
+                        "skipping {} (chapters do not match; check it, then use --force)",
+                        p.folder.name
+                    );
+                    continue;
+                }
+                let Some(rec) = details.get(&p.recording.id) else {
+                    continue;
+                };
+                let base = canvas_core::sanitize(&p.folder.name);
+                let mp4 = p.folder.path.join(format!("{base}.mp4"));
+                match recap
+                    .download_mp4_to(rec, &mp4, &tmp, &|m: &str| eprintln!("{m}"))
+                    .await
+                {
+                    Ok(Some(_)) => written.push(mp4),
+                    Ok(None) => skipped += 1,
+                    Err(e @ canvas_core::Error::SessionExpired) => return Err(e.into()),
+                    Err(e) => failed.push((p.folder.name.clone(), e.to_string())),
+                }
+                if transcripts {
+                    let txt = p.folder.path.join(format!("{base}.txt"));
+                    let srt = p.folder.path.join(format!("{base}.srt"));
+                    let have =
+                        |f: &std::path::Path| std::fs::metadata(f).is_ok_and(|m| m.len() > 0);
+                    if have(&txt) && have(&srt) {
+                        skipped += 1;
+                        continue;
+                    }
+                    match recap.transcript(rec).await {
+                        Ok(t) => {
+                            for (path, body) in [(srt, &t.srt), (txt, &t.text)] {
+                                // Never overwrite a file the user already has.
+                                match panopto::write_new(&path, body.as_bytes()) {
+                                    Ok(()) => written.push(path),
+                                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                                    Err(e) => {
+                                        failed.push((path.display().to_string(), e.to_string()))
+                                    }
+                                }
+                            }
+                        }
+                        Err(e @ canvas_core::Error::SessionExpired) => return Err(e.into()),
+                        Err(e) => {
+                            failed.push((format!("{} transcript", p.folder.name), e.to_string()))
+                        }
+                    }
+                }
+            }
+            if cli.json {
+                let failed: Vec<_> = failed
+                    .iter()
+                    .map(|(n, e)| serde_json::json!({ "folder": n, "error": e }))
+                    .collect();
+                print_json(
+                    &serde_json::json!({ "plan": plan, "written": written, "skipped": skipped, "failed": failed }),
+                );
+            } else {
+                out!(
+                    "\n{} file(s) written, {skipped} already there, {} failed",
+                    written.len(),
+                    failed.len()
+                );
+                for (n, e) in &failed {
+                    out!("  failed: {n} ({e})");
+                }
+            }
+            if !failed.is_empty() {
+                anyhow::bail!("{} item(s) could not be filed", failed.len());
             }
         }
         Command::Recap(RecapCommand::Info { recording }) => {

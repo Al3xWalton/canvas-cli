@@ -115,36 +115,16 @@ impl Panopto {
         };
 
         if !options.no_mp4 {
-            let url = recording.mp4_url.as_deref().ok_or_else(|| {
-                Error::NotFound(format!(
-                    "recording {} has no MP4 yet; try --streams",
-                    recording.id
-                ))
-            })?;
             let dest = dir.join(format!("{stem}.mp4"));
-            if done(&dest) {
-                out.skipped.push(dest);
-            } else {
-                progress(&format!("downloading {stem}.mp4"));
-                let part = tmp.join(format!("{}.part", recording.id));
-                let result = match self.fetch_to(url, &part, &dest).await {
-                    // The signed link expired: get a fresh one and resume.
-                    Err(Error::Forbidden(_)) => {
-                        progress("download link expired; getting a fresh one");
-                        let fresh = self.recording(&recording.id).await?;
-                        let url = fresh.mp4_url.ok_or_else(|| {
-                            Error::NotFound(format!(
-                                "recording {} no longer has an MP4",
-                                recording.id
-                            ))
-                        })?;
-                        self.fetch_to(&url, &part, &dest).await
-                    }
-                    other => other,
-                };
-                let bytes = result?;
-                out.bytes += bytes;
-                out.written.push(dest);
+            match self
+                .download_mp4_to(recording, &dest, &tmp, &progress)
+                .await?
+            {
+                Some(bytes) => {
+                    out.bytes += bytes;
+                    out.written.push(dest);
+                }
+                None => out.skipped.push(dest),
             }
         }
 
@@ -182,6 +162,75 @@ impl Panopto {
             }
         }
         Ok(out)
+    }
+
+    /// Downloads `recording`'s composite MP4 to exactly `dest`, using
+    /// `tmp` for the partial file. Returns `None` if `dest` already exists
+    /// (non-empty) and was left alone, otherwise the bytes fetched.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if the recording has no MP4; as for
+    /// [`Panopto::download`] otherwise.
+    pub async fn download_mp4_to(
+        &self,
+        recording: &Recording,
+        dest: &Path,
+        tmp: &Path,
+        progress: &impl Fn(&str),
+    ) -> Result<Option<u64>> {
+        if !crate::is_uuid(&recording.id) {
+            return Err(Error::Input(format!(
+                "`{}` is not a ReCap delivery ID",
+                recording.id
+            )));
+        }
+        match std::fs::metadata(dest) {
+            Ok(m) if m.len() > 0 => return Ok(None),
+            // An empty file holds nothing to lose: clear it so the
+            // no-replace move below can put the real file there.
+            Ok(m) if m.is_file() => {
+                let _ = std::fs::remove_file(dest);
+            }
+            _ => {}
+        }
+        let url = recording.mp4_url.as_deref().ok_or_else(|| {
+            Error::NotFound(format!(
+                "recording {} has no MP4 yet; try --streams",
+                recording.id
+            ))
+        })?;
+        std::fs::create_dir_all(tmp).map_err(|source| Error::Io {
+            path: tmp.to_owned(),
+            source,
+        })?;
+        let name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        progress(&format!("downloading {name}"));
+        let part = tmp.join(format!("{}.part", recording.id));
+        let result = match self.fetch_to(url, &part, dest).await {
+            // The signed link expired: get a fresh one and resume.
+            Err(Error::Forbidden(_)) => {
+                progress("download link expired; getting a fresh one");
+                let fresh = self.recording(&recording.id).await?;
+                let url = fresh.mp4_url.ok_or_else(|| {
+                    Error::NotFound(format!("recording {} no longer has an MP4", recording.id))
+                })?;
+                self.fetch_to(&url, &part, dest).await
+            }
+            other => other,
+        };
+        match result {
+            Ok(n) => Ok(Some(n)),
+            // Someone (e.g. the user) put a file there during the download:
+            // keep theirs and report it as already there.
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&part);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Fetches a signed CDN URL (no cookie) into `part`, resuming from
@@ -264,7 +313,7 @@ impl Panopto {
                     .and_then(|v| v.strip_prefix("bytes */"))
                     .and_then(|v| v.parse::<u64>().ok());
                 if total == Some(have) && have > 0 {
-                    std::fs::rename(part, dest).map_err(|source| Error::Io {
+                    move_into(part, dest).map_err(|source| Error::Io {
                         path: dest.to_owned(),
                         source,
                     })?;
@@ -326,7 +375,7 @@ impl Panopto {
         }
         // Rename while the lock is still held, so no other run can reopen
         // the finished part in between.
-        std::fs::rename(part, dest).map_err(|source| Error::Io {
+        move_into(part, dest).map_err(|source| Error::Io {
             path: dest.to_owned(),
             source,
         })?;
@@ -334,6 +383,51 @@ impl Panopto {
         drop(file);
         Ok(received)
     }
+}
+
+/// Moves `part` to `dest` **without ever replacing an existing file**.
+///
+/// On the same disk this is a hard link (which fails with `AlreadyExists`
+/// if `dest` exists) followed by removing `part`. Across disks the bytes
+/// are copied to a hidden temp file beside `dest`, flushed, and linked into
+/// place the same way, so a failed copy never leaves a partial file under
+/// the real name.
+pub(crate) fn move_into(part: &Path, dest: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(part, dest) {
+        Ok(()) => std::fs::remove_file(part),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            let name = dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let side = dest.with_file_name(format!(".{name}.{}.canvas-part", std::process::id()));
+            let copied = std::fs::copy(part, &side)
+                .and_then(|_| std::fs::File::open(&side)?.sync_all())
+                .and_then(|()| std::fs::hard_link(&side, dest));
+            let _ = std::fs::remove_file(&side);
+            copied?;
+            std::fs::remove_file(part)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes `body` to a new file at `path`, never replacing an existing one:
+/// written to a hidden temp file beside it, then linked into place.
+///
+/// # Errors
+/// `AlreadyExists` if `path` exists; other I/O errors as they occur.
+pub fn write_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let side = path.with_file_name(format!(".{name}.{}.canvas-part", std::process::id()));
+    let result = std::fs::write(&side, body)
+        .and_then(|()| std::fs::File::open(&side)?.sync_all())
+        .and_then(|()| std::fs::hard_link(&side, path));
+    let _ = std::fs::remove_file(&side);
+    result
 }
 
 /// Removes temp files older than a week that no run is using, including
@@ -676,6 +770,30 @@ mod tests {
         assert_eq!(content_range("bytes 8-19/20"), Some((8, Some(20))));
         assert_eq!(content_range("bytes 8-19/*"), Some((8, None)));
         assert_eq!(content_range("items 1-2/3"), None);
+    }
+
+    #[test]
+    fn move_into_and_write_new_never_replace() {
+        let d = dir("noclobber");
+        std::fs::create_dir_all(&d).unwrap();
+        let (part, dest) = (d.join("p.part"), d.join("Lecture.mp4"));
+        std::fs::write(&part, b"new").unwrap();
+        std::fs::write(&dest, b"user's own").unwrap();
+        let err = move_into(&part, &dest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"user's own");
+        assert!(write_new(&dest, b"x").is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"user's own");
+        let fresh = d.join("notes.txt");
+        write_new(&fresh, b"hello").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"hello");
+        let hidden: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".canvas-part"))
+            .collect();
+        assert!(hidden.is_empty(), "no temp files left behind");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[tokio::test]
