@@ -28,8 +28,10 @@
 //! `travbend/panopto-downloader` extension; no code was copied from it.
 
 mod download;
+mod transcript;
 
 pub use download::{DownloadOptions, Downloaded, file_stem};
+pub use transcript::{Cue, Transcript, parse_srt, to_text};
 
 use canvas_auth::Session;
 use canvas_core::{Config, Error, Result};
@@ -42,7 +44,7 @@ use serde::{Deserialize, Serialize};
 pub struct Panopto {
     pub(crate) http: reqwest::Client,
     host: String,
-    cookie: String,
+    pub(crate) cookie: String,
     csrf: Option<String>,
 }
 
@@ -387,7 +389,7 @@ impl Panopto {
 
     /// Returns the tenant's base URL. Only an exact loopback host (for
     /// tests) uses plain http; everything else is https.
-    fn base(&self) -> String {
+    pub(crate) fn base(&self) -> String {
         let name = self
             .host
             .rsplit_once(':')
