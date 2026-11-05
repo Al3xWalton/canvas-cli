@@ -106,6 +106,21 @@ enum Command {
         /// Course id, code or part of the name.
         course: Option<String>,
     },
+    /// What is new since the last run, plus what is due soon.
+    Digest {
+        /// `last` (since the previous `--since last` run) or a window like 2d.
+        #[arg(long, default_value = "last")]
+        since: String,
+        /// Also list unsubmitted work due within this window.
+        #[arg(long, default_value = "7d", value_parser = canvas_api::parse_window)]
+        upcoming: chrono::Duration,
+        /// Skip course files (faster).
+        #[arg(long)]
+        no_files: bool,
+        /// Skip ReCap recordings.
+        #[arg(long)]
+        no_recordings: bool,
+    },
     /// Panopto ReCap lecture recordings.
     #[command(subcommand)]
     Recap(RecapCommand),
@@ -447,6 +462,75 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+        }
+        Command::Digest {
+            since,
+            upcoming,
+            no_files,
+            no_recordings,
+        } => {
+            let client = client(&config)?;
+            let session = canvas_auth::load()?;
+            let recap = panopto::Panopto::new(&config, &session).ok();
+            let now = chrono::Utc::now();
+            let (since, from_marker) = canvas_digest::resolve_since(
+                &since,
+                &config.download_root,
+                now,
+                chrono::Duration::days(7),
+            )?;
+            let options = canvas_digest::Options {
+                since,
+                upcoming,
+                files: !no_files,
+                recordings: !no_recordings,
+            };
+            let (previous, note) = canvas_digest::load_state(&config.download_root, now);
+            // Compare with the saved state only for scheduled (`last`) runs.
+            let previous = previous.filter(|_| from_marker);
+            let (mut d, state) =
+                canvas_digest::digest(&client, recap.as_ref(), &options, previous.as_ref()).await?;
+            d.skipped.extend(note);
+            if cli.json {
+                print_json(&d);
+            } else {
+                out!("Since {}", local_time(since));
+                if d.no_changes() {
+                    out!("Nothing new.");
+                }
+                for a in &d.new_announcements {
+                    out!("announcement  {}", a.title);
+                }
+                for a in &d.new_assignments {
+                    out!("new work      {}  {}", a.course, a.item.name);
+                }
+                for a in &d.changed_assignments {
+                    out!("changed       {}  {}", a.course, a.item.name);
+                }
+                for f in &d.new_files {
+                    out!("file          {}  {}", f.course, f.item.display_name);
+                }
+                for r in &d.new_recordings {
+                    out!("recording     {}  {}", r.course, r.item.title);
+                }
+                if !d.upcoming.is_empty() {
+                    out!("\nDue soon:");
+                    for u in &d.upcoming {
+                        let due = u.item.due_at.map(local_time).unwrap_or_default();
+                        out!("  {due:<17} {}  {}", u.course, u.item.name);
+                    }
+                }
+                for s in &d.skipped {
+                    out!("not checked: {s}");
+                }
+            }
+            // Only `--since last` advances the saved state, so ad-hoc
+            // queries never hide changes from the next scheduled run. It is
+            // saved after printing; a failure is a warning, not lost output.
+            if from_marker && let Err(e) = canvas_digest::save_state(&config.download_root, &state)
+            {
+                eprintln!("warning: could not save the digest state: {e}");
             }
         }
         Command::Recap(RecapCommand::List { course }) => {

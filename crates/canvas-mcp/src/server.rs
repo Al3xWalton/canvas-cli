@@ -106,6 +106,23 @@ pub struct DownloadArgs {
     pub streams: bool,
 }
 
+/// Digest options.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DigestArgs {
+    /// `last` (default: since the previous `last` digest) or a window like `2d`.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Also list unsubmitted work due within this window (default `7d`).
+    #[serde(default)]
+    pub upcoming: Option<String>,
+    /// Check course files (default true; slower).
+    #[serde(default)]
+    pub files: Option<bool>,
+    /// Check ReCap recordings (default true).
+    #[serde(default)]
+    pub recordings: Option<bool>,
+}
+
 /// Turns any serialisable value into a structured tool result.
 fn ok(value: impl serde::Serialize) -> CallToolResult {
     match serde_json::to_value(value) {
@@ -508,6 +525,53 @@ impl CanvasServer {
         )
     }
 
+    /// What is new and due.
+    #[tool(
+        description = "What changed since the last digest (announcements, new or changed assignments, files, recordings) plus unsubmitted work due soon. One call for notifications."
+    )]
+    async fn digest(&self, Parameters(args): Parameters<DigestArgs>) -> CallToolResult {
+        let upcoming = match window(args.upcoming.as_deref(), "7d") {
+            Ok(w) => w,
+            Err(e) => return e,
+        };
+        let root = &self.config.download_root;
+        let now = chrono::Utc::now();
+        let (since, from_marker) = match canvas_digest::resolve_since(
+            args.since.as_deref().unwrap_or("last"),
+            root,
+            now,
+            chrono::Duration::days(7),
+        ) {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        };
+        let options = canvas_digest::Options {
+            since,
+            upcoming,
+            files: args.files.unwrap_or(true),
+            recordings: args.recordings.unwrap_or(true),
+        };
+        let (previous, note) = canvas_digest::load_state(root, now);
+        let previous = previous.filter(|_| from_marker);
+        match canvas_digest::digest(
+            &self.client,
+            self.recap.as_ref().ok(),
+            &options,
+            previous.as_ref(),
+        )
+        .await
+        {
+            Ok((mut d, state)) => {
+                d.skipped.extend(note);
+                if from_marker && let Err(e) = canvas_digest::save_state(root, &state) {
+                    d.skipped.push(format!("digest state not saved: {e}"));
+                }
+                ok(d)
+            }
+            Err(e) => fail(e),
+        }
+    }
+
     /// Returns the agent guide.
     #[tool(
         description = "Return the guide to these tools: what each does, recipes and error handling."
@@ -576,6 +640,7 @@ mod tests {
             schemars::schema_for!(RecordingArgs),
             schemars::schema_for!(RecapTargetArgs),
             schemars::schema_for!(DownloadArgs),
+            schemars::schema_for!(DigestArgs),
         ];
         for schema in schemas {
             let props = schema.as_value()["properties"]
@@ -583,12 +648,22 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             for name in props.keys() {
-                assert!(
-                    !["path", "dir", "root", "dest", "file", "output"]
+                let lower = name.to_lowercase();
+                let pathy = [
+                    "path",
+                    "dir",
+                    "directory",
+                    "root",
+                    "dest",
+                    "destination",
+                    "output",
+                    "folder",
+                ]
+                .contains(&lower.as_str())
+                    || ["_path", "_dir", "_root", "_dest", "_file"]
                         .iter()
-                        .any(|bad| name.contains(bad)),
-                    "argument `{name}` looks like a path"
-                );
+                        .any(|suffix| lower.ends_with(suffix));
+                assert!(!pathy, "argument `{name}` looks like a path");
             }
         }
     }

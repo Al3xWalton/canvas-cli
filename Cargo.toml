@@ -16,6 +16,7 @@ canvas-auth = { path = "crates/canvas-auth" }
 canvas-api = { path = "crates/canvas-api" }
 canvas-sync = { path = "crates/canvas-sync" }
 panopto = { path = "crates/panopto" }
+canvas-digest = { path = "crates/canvas-digest" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

@@ -90,6 +90,12 @@ pub struct Assignment {
     pub submission_types: Vec<String>,
     /// Link to the assignment in the Canvas web UI.
     pub html_url: String,
+    /// When it was created.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    /// When it last changed (e.g. a new due date).
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
     /// The user's submission, when requested.
     #[serde(default)]
     pub submission: Option<Submission>,

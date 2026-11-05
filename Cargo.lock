@@ -216,6 +216,7 @@ dependencies = [
  "canvas-api",
  "canvas-auth",
  "canvas-core",
+ "canvas-digest",
  "canvas-sync",
  "chrono",
  "clap",
@@ -237,6 +238,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "canvas-digest"
+version = "0.1.0"
+dependencies = [
+ "canvas-api",
+ "canvas-core",
+ "canvas-sync",
+ "chrono",
+ "futures",
+ "panopto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "canvas-mcp"
 version = "0.1.0"
 dependencies = [
@@ -244,6 +259,7 @@ dependencies = [
  "canvas-api",
  "canvas-auth",
  "canvas-core",
+ "canvas-digest",
  "canvas-sync",
  "chrono",
  "clap",

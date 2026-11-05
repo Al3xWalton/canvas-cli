@@ -13,6 +13,15 @@ name (`example studies`). An ambiguous name returns the candidates.
   first in a long job.
 - `usage`: returns this guide.
 
+## Notifications
+- `digest` (`since` defaults to `last`, also a window like `2d`; `upcoming`
+  defaults to `7d`; `files` and `recordings` default to true): one call that
+  returns what changed since the previous `last` digest (new announcements,
+  new or changed assignments, new files, new recordings) plus unsubmitted
+  work due soon. `since: "last"` advances a shared marker, so use it from one
+  scheduled notification agent only; pass a window for one-off questions.
+  Check `skipped` for parts that could not be checked.
+
 ## Deadlines and timetable
 - `list_assignments` (`within` defaults to `7d`; also `48h`, `2w`; optional
   `course`): due soonest first, each with `due_at` (RFC 3339 UTC),
@@ -57,8 +66,9 @@ name (`example studies`). An ambiguous name returns the candidates.
   the ones with a `start_time` in the last 7 days, then call `get_transcript`
   for each. Structure the notes by its `## chapter` headings and cite the
   lecture title and date.
-- **What changed since yesterday:** call `list_announcements` with
-  `within: "1d"`, then `list_assignments`.
+- **Daily notification:** call `digest` and report each `new_*` and
+  `changed_assignments` item, then `upcoming`. Say "nothing new" when they
+  are all empty.
 
 ## Errors
 - `Canvas session expired or missing. Run canvas auth login.` means the user
