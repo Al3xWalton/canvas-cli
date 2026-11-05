@@ -216,6 +216,7 @@ dependencies = [
  "canvas-api",
  "canvas-auth",
  "canvas-core",
+ "canvas-sync",
  "chrono",
  "clap",
  "serde",
@@ -254,7 +255,13 @@ dependencies = [
 name = "canvas-sync"
 version = "0.1.0"
 dependencies = [
+ "canvas-api",
+ "canvas-auth",
  "canvas-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

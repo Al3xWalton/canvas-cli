@@ -106,6 +106,9 @@ enum Command {
         /// Course id, code or part of the name.
         course: Option<String>,
     },
+    /// List or download course files.
+    #[command(subcommand)]
+    Files(FilesCommand),
     /// List a course's discussion topics.
     Discussions {
         /// Course id, code or part of the name.
@@ -129,6 +132,27 @@ enum AuthCommand {
     Status,
     /// Delete the stored session from the keychain.
     Logout,
+}
+
+/// `canvas files ...`
+#[derive(Debug, Subcommand)]
+enum FilesCommand {
+    /// List a course's files (from the Files tab and from modules).
+    List {
+        /// Course id, code or part of the name.
+        course: String,
+    },
+    /// Download new and changed files to the download root.
+    Sync {
+        /// Course id, code or part of the name. Omit with --all.
+        course: Option<String>,
+        /// Sync every active course.
+        #[arg(long, conflicts_with = "course")]
+        all: bool,
+        /// Download here instead of the configured download_root.
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
 }
 
 /// `canvas mcp ...`
@@ -376,6 +400,85 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Files(FilesCommand::List { course }) => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let (files, failed) = canvas_sync::list_files(&client, &course).await?;
+            if cli.json {
+                print_json(&serde_json::json!({ "files": files, "failed": failed }));
+            } else {
+                for f in &files {
+                    let lock = if f.locked_for_user { " (locked)" } else { "" };
+                    out!("{:>10}  {}{lock}", human_bytes(f.size), f.display_name);
+                }
+                for f in &failed {
+                    out!("    failed  {} ({})", f.name, f.reason);
+                }
+            }
+            if !failed.is_empty() {
+                anyhow::bail!("{} file(s) could not be read", failed.len());
+            }
+        }
+        Command::Files(FilesCommand::Sync { course, all, root }) => {
+            let client = client(&config)?;
+            let courses = match (course, all) {
+                (Some(text), _) => vec![canvas_api::resolve_course(&client, &text).await?],
+                (None, true) => client.courses().await?,
+                (None, false) => anyhow::bail!("name a course, or pass --all"),
+            };
+            let root = root.unwrap_or_else(|| config.download_root.clone());
+            let mut reports = Vec::new();
+            let mut course_errors: Vec<(u64, String)> = Vec::new();
+            for course in &courses {
+                let quiet = cli.json;
+                let result = canvas_sync::sync_course(&client, course, &root, |path| {
+                    if !quiet {
+                        eprintln!("downloading {path}");
+                    }
+                })
+                .await;
+                match result {
+                    Ok(report) => reports.push(report),
+                    // An expired session fails every course; stop now.
+                    Err(e @ canvas_core::Error::SessionExpired) => return Err(e.into()),
+                    Err(e) => course_errors.push((course.id, e.to_string())),
+                }
+            }
+            let failed: usize =
+                reports.iter().map(|r| r.failed.len()).sum::<usize>() + course_errors.len();
+            if cli.json {
+                let errors: Vec<_> = course_errors
+                    .iter()
+                    .map(|(id, e)| serde_json::json!({ "course_id": id, "error": e }))
+                    .collect();
+                print_json(&serde_json::json!({ "courses": reports, "course_errors": errors }));
+            } else {
+                for r in &reports {
+                    out!(
+                        "course {}: {} downloaded ({}), {} unchanged, {} locked, {} failed",
+                        r.course_id,
+                        r.downloaded.len(),
+                        human_bytes(r.bytes),
+                        r.unchanged,
+                        r.locked.len(),
+                        r.failed.len()
+                    );
+                    for f in &r.failed {
+                        out!("  failed: {} ({})", f.name, f.reason);
+                    }
+                    for w in &r.warnings {
+                        out!("  warning: {w}");
+                    }
+                }
+                for (id, e) in &course_errors {
+                    out!("course {id}: not synced ({e})");
+                }
+                out!("Files are in {}", root.display());
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} file(s) or course(s) failed to sync");
+            }
+        }
         Command::Discussions { course } => {
             let client = client(&config)?;
             let course = canvas_api::resolve_course(&client, &course).await?;
@@ -475,6 +578,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Formats a byte count as B, KB, MB or GB.
+fn human_bytes(n: u64) -> String {
+    match n {
+        n if n < 1_000 => format!("{n} B"),
+        n if n < 1_000_000 => format!("{:.0} KB", n as f64 / 1e3),
+        n if n < 1_000_000_000 => format!("{:.1} MB", n as f64 / 1e6),
+        n => format!("{:.2} GB", n as f64 / 1e9),
+    }
 }
 
 /// Formats a UTC time in the user's local zone for text output.

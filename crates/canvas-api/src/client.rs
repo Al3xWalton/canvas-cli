@@ -47,9 +47,11 @@ impl Client {
             // instead of following it to an HTML page.
             .redirect(redirect::Policy::none())
             // An unanswered request must fail, not hang: the MCP server
-            // checks the session before its handshake.
+            // checks the session before its handshake. The limit is on
+            // silence between reads, not total time, so large lecture
+            // downloads can still finish.
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(60))
+            .read_timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(Self {
@@ -139,6 +141,89 @@ impl Client {
         Ok(out)
     }
 
+    /// Downloads `url` into `dest`, returning the number of bytes written.
+    /// If `expected` is given, a body of any other length is an error.
+    ///
+    /// The session cookie is sent only while the URL is on the Canvas
+    /// origin. Canvas answers file downloads with a redirect to a separate
+    /// content host (`*.canvas-user-content.com`), which is fetched without
+    /// it. A redirect back to the login page means the session expired.
+    ///
+    /// # Errors
+    /// [`Error::SessionExpired`], [`Error::Forbidden`], [`Error::NotFound`],
+    /// [`Error::Http`] for other failures or more than 5 redirects, and
+    /// [`Error::Io`] if `dest` cannot be written.
+    pub async fn download(
+        &self,
+        url: &str,
+        dest: &std::path::Path,
+        expected: Option<u64>,
+    ) -> Result<u64> {
+        let mut url = url::Url::parse(url).map_err(|e| Error::Http(e.to_string()))?;
+        for _ in 0..6 {
+            let on_canvas = url.origin() == self.base.origin();
+            let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+            if url.scheme() != "https" && !on_canvas && !loopback {
+                return Err(Error::Http("download redirected to a non-https URL".into()));
+            }
+            let mut request = self.http.get(url.clone());
+            if on_canvas {
+                request = request.header(header::COOKIE, &self.cookie);
+            }
+            let mut response = request
+                .send()
+                .await
+                .map_err(|e| Error::Http(e.to_string()))?;
+            let status = response.status();
+            if status.is_redirection() {
+                let location = response
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| Error::Http("redirect without a location".into()))?;
+                let next = url.join(location).map_err(|e| Error::Http(e.to_string()))?;
+                if next.origin() == self.base.origin() && next.path().starts_with("/login") {
+                    return Err(Error::SessionExpired);
+                }
+                url = next;
+                continue;
+            }
+            match status {
+                StatusCode::UNAUTHORIZED if on_canvas => return Err(Error::SessionExpired),
+                StatusCode::FORBIDDEN => return Err(Error::Forbidden("file download".into())),
+                StatusCode::NOT_FOUND => return Err(Error::NotFound("file download".into())),
+                s if !s.is_success() => {
+                    return Err(Error::Http(format!("file download returned {s}")));
+                }
+                _ => {}
+            }
+            let io = |source| Error::Io {
+                path: dest.to_owned(),
+                source,
+            };
+            let mut file = std::fs::File::create(dest).map_err(io)?;
+            let mut written = 0u64;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| Error::Http(e.to_string()))?
+            {
+                std::io::Write::write_all(&mut file, &chunk).map_err(io)?;
+                written += chunk.len() as u64;
+            }
+            file.sync_all().map_err(io)?;
+            if let Some(expected) = expected.filter(|e| *e != written) {
+                return Err(Error::Http(format!(
+                    "download was {written} bytes, Canvas said {expected}; it may have been cut off"
+                )));
+            }
+            return Ok(written);
+        }
+        Err(Error::Http(
+            "file download redirected more than 5 times".into(),
+        ))
+    }
+
     fn url(&self, path: &str) -> Result<url::Url> {
         self.base.join(path).map_err(|e| Error::Http(e.to_string()))
     }
@@ -188,6 +273,9 @@ impl Client {
                     .unwrap_or(self.backoff * 2u32.pow(attempt - 1));
                 tokio::time::sleep(wait).await;
                 continue;
+            }
+            if status == StatusCode::FORBIDDEN && !limited {
+                return Err(Error::Forbidden(what.to_owned()));
             }
             if status == StatusCode::NOT_FOUND {
                 return Err(Error::NotFound(what.to_owned()));
@@ -257,7 +345,9 @@ mod tests {
                 let mut buf = vec![0; 8192];
                 let n = socket.read(&mut buf).await.unwrap();
                 seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                let response = response.replace("{base}", &me);
+                let response = response
+                    .replace("{base}", &me)
+                    .replace("{other}", &me.replace("127.0.0.1", "localhost"));
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
             seen
@@ -387,7 +477,10 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
         ])
         .await;
-        assert!(matches!(client(&base).courses().await, Err(Error::Http(_))));
+        assert!(matches!(
+            client(&base).courses().await,
+            Err(Error::Forbidden(_))
+        ));
         assert_eq!(requests.await.unwrap().len(), 1);
     }
 
@@ -442,5 +535,76 @@ mod tests {
         .await;
         let courses = client(&base).courses().await.unwrap();
         assert_eq!(courses.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn download_drops_the_cookie_when_redirected_off_canvas() {
+        // `{other}` is the same loopback server named `localhost`, so its
+        // origin differs from the Canvas base (`127.0.0.1`).
+        let (base, requests) = serve(vec![
+            "HTTP/1.1 302 Found\r\nLocation: {other}/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_owned(),
+        ])
+        .await;
+        let dest = std::env::temp_dir().join(format!("canvas-dl-redirect-{}", std::process::id()));
+        let n = client(&base)
+            .download(&format!("{base}/files/1/download"), &dest, Some(5))
+            .await
+            .unwrap();
+        let requests = requests.await.unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        assert_eq!(n, 5);
+        assert!(requests[0].contains("canvas_session=abc"));
+        assert!(requests[1].starts_with("GET /blob "));
+        assert!(
+            !requests[1].to_lowercase().contains("cookie"),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn download_redirect_to_login_means_expired() {
+        let (base, _) = serve(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /login/saml\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ])
+        .await;
+        let dest = std::env::temp_dir().join(format!("canvas-dl-login-{}", std::process::id()));
+        let err = client(&base)
+            .download(&format!("{base}/files/1/download"), &dest, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::SessionExpired));
+    }
+
+    #[tokio::test]
+    async fn download_writes_the_body() {
+        let (base, _) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_owned(),
+        ])
+        .await;
+        let dest = std::env::temp_dir().join(format!("canvas-dl-body-{}", std::process::id()));
+        let n = client(&base)
+            .download(&format!("{base}/f"), &dest, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn short_download_is_an_error() {
+        let (base, _) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nhel".to_owned(),
+        ])
+        .await;
+        let dest = std::env::temp_dir().join(format!("canvas-dl-short-{}", std::process::id()));
+        let err = client(&base)
+            .download(&format!("{base}/f"), &dest, Some(5))
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_file(&dest);
+        assert!(err.to_string().contains("cut off"), "{err}");
     }
 }

@@ -47,6 +47,18 @@ pub enum Error {
     /// user.
     #[error("not found: {0}")]
     NotFound(String),
+    /// Canvas answered 403: the user may not see this (e.g. a hidden tab).
+    /// Distinct from [`Error::SessionExpired`], which is a 401.
+    #[error("not allowed: {0}")]
+    Forbidden(String),
+    /// A local file could not be written or read.
+    #[error("file error at {path}: {source}")]
+    Io {
+        /// Path involved.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
     /// The user's input could not be used, e.g. an ambiguous course name.
     #[error("{0}")]
     Input(String),
