@@ -23,6 +23,12 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 dirs = "6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+keyring = { version = "3", features = ["apple-native"] }
+chromiumoxide = { version = "0.9", default-features = false }
+url = "2"
 
 [workspace.lints.rust]
 missing_docs = "warn"

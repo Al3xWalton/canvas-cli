@@ -28,6 +28,29 @@ pub enum Error {
     /// No home or config directory could be found for this user.
     #[error("could not find a config directory for this user")]
     NoConfigDir,
+    /// No session is stored, or Canvas rejected the stored one.
+    ///
+    /// The message is the instruction a person or agent must follow: both
+    /// the CLI and the MCP server surface it unchanged.
+    #[error("Canvas session expired or missing. Run `canvas auth login`.")]
+    SessionExpired,
+    /// The OS keychain refused a read or write.
+    #[error("keychain error: {0}")]
+    Keychain(String),
+    /// Driving Chrome for sign-in failed.
+    #[error("browser sign-in failed: {0}")]
+    Browser(String),
+    /// A request to Canvas or Panopto failed for a reason other than auth.
+    #[error("request failed: {0}")]
+    Http(String),
+    /// A response did not have the shape we expected.
+    #[error("unexpected response from {what}: {detail}")]
+    Decode {
+        /// Which endpoint answered.
+        what: String,
+        /// What was wrong with it.
+        detail: String,
+    },
 }
 
 /// Shorthand for results that fail with [`Error`].
