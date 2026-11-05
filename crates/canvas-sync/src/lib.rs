@@ -29,8 +29,7 @@ use canvas_core::{Error, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Longest file or folder name we write, in bytes.
-const MAX_NAME: usize = 150;
+pub use canvas_core::sanitize;
 
 /// What one sync did.
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
@@ -316,43 +315,6 @@ fn save(path: &Path, manifest: &Manifest) -> Result<()> {
     std::fs::rename(&tmp, path).map_err(io)
 }
 
-/// Makes one path component safe on macOS, Linux and Windows.
-///
-/// Replaces separators, reserved and control characters with `_`, drops
-/// leading dots and trailing dots or spaces, caps the length at 150 bytes
-/// on a character boundary, and never returns empty, `.` or `..`.
-///
-/// # Example
-/// ```
-/// assert_eq!(canvas_sync::sanitize("../Week 1: Intro?.pdf"), "_Week 1_ Intro_.pdf");
-/// assert_eq!(canvas_sync::sanitize(".."), "_");
-/// ```
-pub fn sanitize(name: &str) -> String {
-    let replaced: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let mut s = replaced
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches(['.', ' '])
-        .to_owned();
-    if s.len() > MAX_NAME {
-        let mut end = MAX_NAME;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-    }
-    if s.is_empty() { "_".into() } else { s }
-}
-
 /// Inserts ` (<id>)` before the extension, to separate same-named files.
 fn with_id(name: &str, id: u64) -> String {
     match name.rsplit_once('.') {
@@ -389,7 +351,7 @@ mod tests {
     fn sanitize_caps_length_on_a_char_boundary() {
         let long = "é".repeat(200);
         let s = sanitize(&long);
-        assert!(s.len() <= MAX_NAME);
+        assert!(s.len() <= 150);
         assert!(s.chars().all(|c| c == 'é'));
     }
 

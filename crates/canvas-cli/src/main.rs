@@ -145,6 +145,23 @@ enum RecapCommand {
         /// Course id, code (e.g. ABC1016) or part of the name.
         course: String,
     },
+    /// Download recordings as MP4: one recording, or a whole course.
+    Download {
+        /// Viewer URL or delivery ID, or a course id, code or name.
+        target: String,
+        /// Also save the separate camera and screen streams (needs ffmpeg).
+        #[arg(long)]
+        streams: bool,
+        /// Skip the composite MP4 (use with --streams).
+        #[arg(long, requires = "streams")]
+        no_mp4: bool,
+        /// For a course, only the newest N recordings.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        latest: Option<u64>,
+        /// Download here instead of the configured download_root.
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// Show a recording's details and streams.
     Info {
         /// Viewer or embed URL, or the delivery ID.
@@ -454,6 +471,99 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         r.title
                     );
                 }
+            }
+        }
+        Command::Recap(RecapCommand::Download {
+            target,
+            streams,
+            no_mp4,
+            latest,
+            root,
+        }) => {
+            let session = canvas_auth::load()?;
+            let recap = panopto::Panopto::new(&config, &session)?;
+            let root = root.unwrap_or_else(|| config.download_root.clone());
+            let options = panopto::DownloadOptions { streams, no_mp4 };
+            // A recording if it parses as one, otherwise a course.
+            let (dir, ids) = match panopto::delivery_id(&target) {
+                Ok(id) => (root.join("ReCap"), vec![id]),
+                Err(_) => {
+                    let client = client(&config)?;
+                    let course = canvas_api::resolve_course(&client, &target).await?;
+                    let code = course
+                        .course_code
+                        .as_deref()
+                        .and_then(panopto::module_code)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "course {} has no module code to find its ReCap folder",
+                                course.id
+                            )
+                        })?;
+                    let term = course.term.as_ref().map(|t| t.name.as_str());
+                    let found = recap.course_recordings(&code, term).await?;
+                    if let Some(w) = &found.warning {
+                        eprintln!("warning: {w}");
+                    }
+                    let dir = root
+                        .join(canvas_core::sanitize(
+                            course.course_code.as_deref().unwrap_or(&course.name),
+                        ))
+                        .join("ReCap");
+                    let ids = found
+                        .recordings
+                        .into_iter()
+                        .take(
+                            latest.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+                        )
+                        .map(|r| r.id)
+                        .collect();
+                    (dir, ids)
+                }
+            };
+            let mut done = Vec::new();
+            let mut failed: Vec<(String, String)> = Vec::new();
+            for id in ids {
+                let quiet = cli.json;
+                let result = async {
+                    let recording = recap.recording(&id).await?;
+                    recap
+                        .download(&recording, &dir, &options, |m| {
+                            if !quiet {
+                                eprintln!("{m}");
+                            }
+                        })
+                        .await
+                }
+                .await;
+                match result {
+                    Ok(d) => done.push(d),
+                    Err(e @ canvas_core::Error::SessionExpired) => return Err(e.into()),
+                    Err(e) => failed.push((id, e.to_string())),
+                }
+            }
+            if cli.json {
+                let failed: Vec<_> = failed
+                    .iter()
+                    .map(|(id, e)| serde_json::json!({ "id": id, "error": e }))
+                    .collect();
+                print_json(&serde_json::json!({ "downloaded": done, "failed": failed }));
+            } else {
+                let written: usize = done.iter().map(|d| d.written.len()).sum();
+                let skipped: usize = done.iter().map(|d| d.skipped.len()).sum();
+                let bytes: u64 = done.iter().map(|d| d.bytes).sum();
+                out!(
+                    "{written} written ({}), {skipped} already there, {} failed",
+                    human_bytes(bytes),
+                    failed.len()
+                );
+                for (id, e) in &failed {
+                    out!("  failed: {id} ({e})");
+                }
+                out!("Recordings are in {}", dir.display());
+            }
+            if !failed.is_empty() {
+                anyhow::bail!("{} recording(s) failed to download", failed.len());
             }
         }
         Command::Recap(RecapCommand::Info { recording }) => {

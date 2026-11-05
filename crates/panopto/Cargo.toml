@@ -16,9 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 url.workspace = true
+tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "process"] }
 
 [lints]
 workspace = true

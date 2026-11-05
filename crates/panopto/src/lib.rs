@@ -27,6 +27,10 @@
 //! The protocol was learned by studying the GPL-3.0
 //! `travbend/panopto-downloader` extension; no code was copied from it.
 
+mod download;
+
+pub use download::{DownloadOptions, Downloaded, file_stem};
+
 use canvas_auth::Session;
 use canvas_core::{Config, Error, Result};
 use chrono::{DateTime, Utc};
@@ -36,7 +40,7 @@ use serde::{Deserialize, Serialize};
 /// An authenticated client for one Panopto tenant.
 #[derive(Debug, Clone)]
 pub struct Panopto {
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     host: String,
     cookie: String,
     csrf: Option<String>,
@@ -338,7 +342,7 @@ pub fn delivery_id(text: &str) -> Result<String> {
     }
 }
 
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     let groups: Vec<&str> = s.split('-').collect();
     groups.len() == 5
         && groups
