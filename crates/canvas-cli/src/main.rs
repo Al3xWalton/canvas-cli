@@ -6,12 +6,23 @@
 //! printed as one plain line with no backtrace, and the exit code is
 //! non-zero.
 
+use std::io::Write;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use canvas_core::Config;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+
+/// Writes a line to stdout. If stdout is closed (e.g. piped into `head`),
+/// exits quietly instead of panicking.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        if writeln!(std::io::stdout(), $($arg)*).is_err() {
+            std::process::exit(0);
+        }
+    };
+}
 
 /// Read Canvas, download course files and ReCap lectures.
 #[derive(Debug, Parser)]
@@ -42,9 +53,35 @@ enum Command {
         /// How far ahead to look: a number with m, h, d or w.
         #[arg(long, default_value = "7d", value_parser = canvas_api::parse_window)]
         due: chrono::Duration,
-        /// Only this course id.
+        /// Only this course: an id, code or part of the name.
         #[arg(long)]
-        course: Option<u64>,
+        course: Option<String>,
+    },
+    /// List a course's modules and their items.
+    Modules {
+        /// Course id, code (e.g. ABC1020) or part of the name.
+        course: String,
+    },
+    /// List a course's pages, or show one as Markdown.
+    Pages {
+        /// Course id, code or part of the name.
+        course: String,
+        /// Page url slug to show (from the list).
+        page: Option<String>,
+    },
+    /// List recent announcements.
+    Announcements {
+        /// How far back to look: a number with m, h, d or w.
+        #[arg(long, default_value = "14d", value_parser = canvas_api::parse_window)]
+        since: chrono::Duration,
+        /// Only this course: an id, code or part of the name.
+        #[arg(long)]
+        course: Option<String>,
+    },
+    /// List a course's discussion topics.
+    Discussions {
+        /// Course id, code or part of the name.
+        course: String,
     },
 }
 
@@ -119,10 +156,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if cli.json {
                 print_json(&serde_json::json!({ "path": path, "config": config }));
             } else {
-                println!("config         {}", path.display());
-                println!("canvas_url     {}", config.canvas_url);
-                println!("panopto_host   {}", config.panopto_host);
-                println!("download_root  {}", config.download_root.display());
+                out!("config         {}", path.display());
+                out!("canvas_url     {}", config.canvas_url);
+                out!("panopto_host   {}", config.panopto_host);
+                out!("download_root  {}", config.download_root.display());
             }
         }
         Command::Auth(AuthCommand::Login { no_recap, timeout }) => {
@@ -139,7 +176,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if cli.json {
                 print_json(&serde_json::json!({ "signed_in": true, "user": user }));
             } else {
-                println!(
+                out!(
                     "Signed in as {}. Session stored in the keychain.",
                     user.name
                 );
@@ -166,15 +203,91 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 print_json(&status);
             } else {
                 let name = status.user.as_ref().map_or("?", |u| u.name.as_str());
-                println!("Signed in to {} as {name}", status.canvas_url);
-                println!(
+                out!("Signed in to {} as {name}", status.canvas_url);
+                out!(
                     "ReCap session  {}",
                     if status.recap_session { "yes" } else { "no" }
                 );
-                println!("Captured       {}", ago(status.captured_at));
+                out!("Captured       {}", ago(status.captured_at));
                 match status.canvas_expires_at {
-                    Some(t) => println!("Expires        in {}", until(t)),
-                    None => println!("Expires        when Canvas ends the session"),
+                    Some(t) => out!("Expires        in {}", until(t)),
+                    None => out!("Expires        when Canvas ends the session"),
+                }
+            }
+        }
+        Command::Modules { course } => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let modules = client.modules(course.id).await?;
+            if cli.json {
+                print_json(&modules);
+            } else {
+                for m in &modules {
+                    out!("{}", m.name);
+                    for item in m.items.iter().flatten() {
+                        out!("  {:<13} {}", item.kind, item.title);
+                    }
+                }
+            }
+        }
+        Command::Pages { course, page } => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            match page {
+                Some(slug) => {
+                    let page = client.page(course.id, &slug).await?;
+                    if cli.json {
+                        print_json(&page);
+                    } else {
+                        out!("# {}\n\n{}", page.summary.title, page.body);
+                    }
+                }
+                None => {
+                    let pages = client.pages(course.id).await?;
+                    if cli.json {
+                        print_json(&pages);
+                    } else {
+                        for p in &pages {
+                            out!("{:<40} {}", p.url, p.title);
+                        }
+                    }
+                }
+            }
+        }
+        Command::Announcements { since, course } => {
+            let client = client(&config)?;
+            let ids: Vec<u64> = match course {
+                Some(text) => vec![canvas_api::resolve_course(&client, &text).await?.id],
+                None => client.courses().await?.iter().map(|c| c.id).collect(),
+            };
+            let list = client
+                .announcements(&ids, chrono::Utc::now() - since)
+                .await?;
+            if cli.json {
+                print_json(&list);
+            } else if list.is_empty() {
+                out!("No announcements.");
+            } else {
+                for a in &list {
+                    let when = a.posted_at.map(local_time).unwrap_or_default();
+                    out!("{when}  {}\n{}\n", a.title, a.body);
+                }
+            }
+        }
+        Command::Discussions { course } => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let list = client.discussions(course.id).await?;
+            if cli.json {
+                print_json(&list);
+            } else {
+                for d in &list {
+                    out!(
+                        "{:>3} replies ({} unread)  {}",
+                        d.replies,
+                        d.unread,
+                        d.title
+                    );
                 }
             }
         }
@@ -191,17 +304,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let quoted = serde_json::to_string(&bin)?;
             match client {
                 McpClient::Claude => {
-                    println!(
+                    out!(
                         "claude mcp add --scope user canvas -- {}",
                         shell_quote(&bin)
                     )
                 }
                 McpClient::Codex => {
-                    println!(
-                        "Add to ~/.codex/config.toml:\n\n[mcp_servers.canvas]\ncommand = {quoted}"
-                    )
+                    out!("Add to ~/.codex/config.toml:\n\n[mcp_servers.canvas]\ncommand = {quoted}")
                 }
-                McpClient::Cursor => println!(
+                McpClient::Cursor => out!(
                     "Add to ~/.cursor/mcp.json:\n\n{}",
                     serde_json::json!({ "mcpServers": { "canvas": { "command": bin } } })
                 ),
@@ -215,22 +326,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 for c in &courses {
                     let code = c.course_code.as_deref().unwrap_or("");
-                    println!("{:<8} {:<26} {}", c.id, code, c.name);
+                    out!("{:<8} {:<26} {}", c.id, code, c.name);
                 }
             }
         }
         Command::Assignments { due, course } => {
-            let list = canvas_api::upcoming_assignments(
-                &client(&config)?,
-                due,
-                chrono::Utc::now(),
-                course,
-            )
-            .await?;
+            let client = client(&config)?;
+            let course = match course {
+                Some(text) => Some(canvas_api::resolve_course(&client, &text).await?.id),
+                None => None,
+            };
+            let list =
+                canvas_api::upcoming_assignments(&client, due, chrono::Utc::now(), course).await?;
             if cli.json {
                 print_json(&list);
             } else if list.is_empty() {
-                println!("Nothing due.");
+                out!("Nothing due.");
             } else {
                 for u in &list {
                     let when = u
@@ -243,9 +354,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         })
                         .unwrap_or_default();
                     let done = if u.submitted { "submitted" } else { "" };
-                    println!(
+                    out!(
                         "{when:<17} {:<22} {:<10} {}",
-                        u.course, done, u.assignment.name
+                        u.course,
+                        done,
+                        u.assignment.name
                     );
                 }
             }
@@ -255,11 +368,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if cli.json {
                 print_json(&serde_json::json!({ "signed_in": false }));
             } else {
-                println!("Session removed.");
+                out!("Session removed.");
             }
         }
     }
     Ok(())
+}
+
+/// Formats a UTC time in the user's local zone for text output.
+fn local_time(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.with_timezone(&chrono::Local)
+        .format("%a %d %b %H:%M")
+        .to_string()
 }
 
 /// Quotes `text` for a POSIX shell: wraps it in single quotes and escapes
@@ -276,7 +396,7 @@ fn client(config: &Config) -> anyhow::Result<canvas_api::Client> {
 
 fn print_json(value: &impl Serialize) {
     match serde_json::to_string(value) {
-        Ok(s) => println!("{s}"),
+        Ok(s) => out!("{s}"),
         Err(e) => eprintln!("error: {e}"),
     }
 }

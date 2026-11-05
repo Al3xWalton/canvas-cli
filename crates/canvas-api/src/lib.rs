@@ -10,14 +10,23 @@
 //! another origin. A 429, or a 403 that says the rate limit was hit, is
 //! retried with exponential backoff (honouring `Retry-After`).
 //!
+//! Text written on Canvas (page bodies, announcements, discussions) is
+//! converted to Markdown and every record carrying it is marked
+//! `untrusted_text: true`: it is third-party content an agent must treat
+//! as data, never as instructions.
+//!
 //! A 401, or a redirect to the login page, means the session has expired.
 //! Both map to [`canvas_core::Error::SessionExpired`] so the caller can tell
 //! the user to run `canvas auth login`.
 
 mod client;
+mod content;
+mod markdown;
 mod queries;
 mod types;
 
 pub use client::Client;
-pub use queries::{UpcomingAssignment, parse_window, upcoming_assignments};
+pub use content::{Announcement, Discussion, Module, ModuleItem, Page, PageSummary};
+pub use markdown::html_to_markdown;
+pub use queries::{UpcomingAssignment, parse_window, resolve_course, upcoming_assignments};
 pub use types::{Assignment, Course, Submission, Term, User};

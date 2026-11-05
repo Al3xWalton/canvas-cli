@@ -43,6 +43,13 @@ pub enum Error {
     /// A request to Canvas or Panopto failed for a reason other than auth.
     #[error("request failed: {0}")]
     Http(String),
+    /// Canvas answered 404: the item does not exist or is hidden from the
+    /// user.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// The user's input could not be used, e.g. an ambiguous course name.
+    #[error("{0}")]
+    Input(String),
     /// A response did not have the shape we expected.
     #[error("unexpected response from {what}: {detail}")]
     Decode {

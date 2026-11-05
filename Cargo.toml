@@ -29,6 +29,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 keyring = { version = "3", features = ["apple-native"] }
 chromiumoxide = { version = "0.9", default-features = false }
 url = "2"
+htmd = "0.5"
+regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 
 [workspace.lints.rust]

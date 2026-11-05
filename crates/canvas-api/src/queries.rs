@@ -82,6 +82,53 @@ fn filter_upcoming(
         .collect()
 }
 
+/// Finds a course by id (`12345`) or by code or name (`ABC1020`,
+/// `example studies`), case-insensitively.
+///
+/// # Errors
+/// Returns [`Error::Input`] with the candidates if nothing matches or the
+/// text matches more than one course.
+pub async fn resolve_course(client: &Client, text: &str) -> Result<Course> {
+    let courses = client.courses().await?;
+    pick_course(courses, text)
+}
+
+fn pick_course(courses: Vec<Course>, text: &str) -> Result<Course> {
+    let needle = text.trim().to_lowercase();
+    if let Ok(id) = needle.parse::<u64>() {
+        return courses
+            .into_iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| Error::Input(format!("no active course with id {id}")));
+    }
+    let mut matches: Vec<Course> = courses
+        .into_iter()
+        .filter(|c| {
+            c.course_code
+                .as_deref()
+                .is_some_and(|code| code.to_lowercase().contains(&needle))
+                || c.name.to_lowercase().contains(&needle)
+        })
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.swap_remove(0)),
+        0 => Err(Error::Input(format!("no active course matches `{text}`"))),
+        _ => Err(Error::Input(format!(
+            "`{text}` matches {} courses: {}",
+            matches.len(),
+            matches
+                .iter()
+                .map(|c| format!(
+                    "{} ({})",
+                    c.id,
+                    c.course_code.as_deref().unwrap_or(&c.name).trim()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 /// Parses a window such as `7d`, `48h`, `2w` or `90m`.
 ///
 /// # Errors
@@ -140,6 +187,24 @@ mod tests {
         assert_eq!(out[0].assignment.id, 2);
         assert_eq!(out[0].course, "ABC1020");
         assert!(out[0].submitted);
+    }
+
+    #[test]
+    fn courses_resolve_by_id_code_or_name() {
+        let courses: Vec<Course> = serde_json::from_value(serde_json::json!([
+            {"id": 1, "name": "Example Studies - ABC1020", "course_code": "ABC1020 (26/27)"},
+            {"id": 2, "name": "Second Example - ABC1002", "course_code": "ABC1002 (26/27)"},
+            {"id": 3, "name": "Third Example - ABC1015", "course_code": "ABC1015 (26/27)"}
+        ]))
+        .unwrap();
+        assert_eq!(pick_course(courses.clone(), "2").unwrap().id, 2);
+        assert_eq!(pick_course(courses.clone(), "abc1020").unwrap().id, 1);
+        assert_eq!(pick_course(courses.clone(), "third").unwrap().id, 3);
+        let err = pick_course(courses.clone(), "ABC10")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches 2 courses"), "{err}");
+        assert!(pick_course(courses, "99").is_err());
     }
 
     #[test]

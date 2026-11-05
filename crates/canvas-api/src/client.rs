@@ -189,6 +189,9 @@ impl Client {
                 tokio::time::sleep(wait).await;
                 continue;
             }
+            if status == StatusCode::NOT_FOUND {
+                return Err(Error::NotFound(what.to_owned()));
+            }
             if !status.is_success() {
                 return Err(Error::Http(format!("GET {what} returned {status}")));
             }
