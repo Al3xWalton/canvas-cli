@@ -116,7 +116,17 @@ pub struct State {
     /// Courses whose recordings were checked; others keep old entries.
     #[serde(default)]
     pub recording_courses: BTreeSet<u64>,
+    /// File records from the last digest, without download links, so the
+    /// next digest only looks up files it has not seen.
+    #[serde(default)]
+    pub file_cache: BTreeMap<u64, CanvasFile>,
+    /// When every file was last looked up afresh (to catch replaced files).
+    #[serde(default)]
+    pub files_checked_at: Option<DateTime<Utc>>,
 }
+
+/// How long cached file records are trusted before a full re-check.
+const FILE_CACHE_TTL_HOURS: i64 = 24;
 
 /// Everything fetched for one course.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -257,6 +267,16 @@ pub async fn digest(
     let ids: Vec<u64> = courses.iter().map(|c| c.id).collect();
     let announcements = client.announcements(&ids, options.since).await?;
     let mut skipped = Vec::new();
+    // Reuse file records for a day; then look every file up again so a
+    // file replaced under the same id is still noticed.
+    let cache_fresh = previous
+        .and_then(|p| p.files_checked_at)
+        .is_some_and(|at| now - at < Duration::hours(FILE_CACHE_TTL_HOURS));
+    let known: std::collections::HashMap<u64, CanvasFile> = match previous {
+        Some(p) if cache_fresh => p.file_cache.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        _ => std::collections::HashMap::new(),
+    };
+    let known = &known;
     let recap = match (options.recordings, recap) {
         (false, _) => None,
         (true, None) => {
@@ -276,7 +296,7 @@ pub async fn digest(
             let mut notes = Vec::new();
             let assignments = client.assignments(course.id).await?;
             let files = if options.files {
-                match canvas_sync::list_files(client, &course).await {
+                match canvas_sync::list_files_cached(client, &course, known).await {
                     Ok((files, failed)) => {
                         if !failed.is_empty() {
                             notes.push(format!(
@@ -338,7 +358,35 @@ pub async fn digest(
             Err(e) => skipped.push(format!("a course could not be read: {e}")),
         }
     }
+    let file_records: Vec<CanvasFile> = courses
+        .iter()
+        .flat_map(|c| c.files.iter().cloned())
+        .collect();
     let (mut d, mut state) = build(courses, announcements, options, previous, now);
+    if options.files {
+        state.file_cache = file_records
+            .into_iter()
+            .map(|mut f| {
+                // Download links carry a verifier token: never store them.
+                f.url.clear();
+                (f.id, f)
+            })
+            .collect();
+        // Courses that failed this run keep their cached records.
+        if let Some(prev) = previous {
+            for (id, f) in &prev.file_cache {
+                state.file_cache.entry(*id).or_insert_with(|| f.clone());
+            }
+        }
+        state.files_checked_at = if cache_fresh {
+            previous.and_then(|p| p.files_checked_at)
+        } else {
+            Some(now)
+        };
+    } else if let Some(prev) = previous {
+        state.file_cache = prev.file_cache.clone();
+        state.files_checked_at = prev.files_checked_at;
+    }
     // Courses that failed outright keep their previous assignment and file
     // entries, so their changes are reported next time, not lost.
     if let Some(prev) = previous {

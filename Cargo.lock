@@ -279,6 +279,7 @@ dependencies = [
  "canvas-auth",
  "canvas-core",
  "chrono",
+ "futures",
  "serde",
  "serde_json",
  "tokio",

@@ -11,11 +11,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A tiny Canvas stand-in: Files list hidden (403), one module linking one
 /// file, which downloads as `hello`. Counts download hits.
-async fn fake_canvas() -> (String, Arc<AtomicUsize>) {
+async fn fake_canvas() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
-    let (me, counter) = (base.clone(), hits.clone());
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let (me, counter, looked) = (base.clone(), hits.clone(), lookups.clone());
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -28,6 +29,7 @@ async fn fake_canvas() -> (String, Arc<AtomicUsize>) {
             } else if path.starts_with("/api/v1/courses/1/modules") {
                 ("200 OK", r#"[{"id":1,"name":"Week 1","position":1,"items":[{"id":9,"title":"Slides","type":"File","content_id":5},{"id":10,"title":"slides","type":"File","content_id":6}]}]"#.to_owned())
             } else if path.starts_with("/api/v1/courses/1/files/5") {
+                looked.fetch_add(1, Ordering::SeqCst);
                 (
                     "200 OK",
                     format!(
@@ -35,6 +37,7 @@ async fn fake_canvas() -> (String, Arc<AtomicUsize>) {
                     ),
                 )
             } else if path.starts_with("/api/v1/courses/1/files/6") {
+                looked.fetch_add(1, Ordering::SeqCst);
                 (
                     "200 OK",
                     format!(
@@ -61,12 +64,12 @@ async fn fake_canvas() -> (String, Arc<AtomicUsize>) {
             let _ = socket.write_all(response.as_bytes()).await;
         }
     });
-    (base, hits)
+    (base, hits, lookups)
 }
 
 #[tokio::test]
 async fn second_sync_downloads_nothing() {
-    let (base, hits) = fake_canvas().await;
+    let (base, hits, _) = fake_canvas().await;
     let config = Config {
         canvas_url: base,
         ..Config::default()
@@ -123,4 +126,41 @@ async fn second_sync_downloads_nothing() {
     );
 
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn cached_listing_skips_known_files_and_matches_uncached() {
+    let (base, _, lookups) = fake_canvas().await;
+    let config = Config {
+        canvas_url: base,
+        ..Config::default()
+    };
+    let session = Session {
+        captured_at: 0,
+        cookies: vec![Cookie {
+            name: "canvas_session".into(),
+            value: "x".into(),
+            domain: "127.0.0.1".into(),
+            path: "/".into(),
+            expires: None,
+        }],
+    };
+    let client = canvas_api::Client::new(&config, &session).unwrap();
+    let course: canvas_api::Course =
+        serde_json::from_str(r#"{"id":1,"name":"Example Studies","course_code":"ABC1020"}"#)
+            .unwrap();
+    let before = lookups.load(Ordering::SeqCst);
+    let (fresh, _) = canvas_sync::list_files(&client, &course).await.unwrap();
+    let after_fresh = lookups.load(Ordering::SeqCst);
+    assert_eq!(after_fresh - before, 2, "uncached looks up both files");
+    let known = fresh.iter().map(|f| (f.id, f.clone())).collect();
+    let (cached, _) = canvas_sync::list_files_cached(&client, &course, &known)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        after_fresh,
+        "cached looks up nothing"
+    );
+    assert_eq!(cached, fresh, "identical results");
 }

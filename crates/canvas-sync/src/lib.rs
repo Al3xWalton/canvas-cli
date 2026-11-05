@@ -83,14 +83,34 @@ pub async fn list_files(
     client: &Client,
     course: &Course,
 ) -> Result<(Vec<CanvasFile>, Vec<Failure>)> {
-    let (files, _, failed) = collect(client, course).await?;
+    list_files_cached(client, course, &HashMap::new()).await
+}
+
+/// Like [`list_files`], but reuses `known` file records (by id) instead of
+/// fetching each one again. Only files not in `known` are looked up, a few
+/// at a time. The module list is always read, so new files are always
+/// found; a file replaced under the same id is only noticed when the
+/// caller passes an empty `known` (the digest does that daily).
+///
+/// # Errors
+/// As for [`list_files`].
+pub async fn list_files_cached(
+    client: &Client,
+    course: &Course,
+    known: &HashMap<u64, CanvasFile>,
+) -> Result<(Vec<CanvasFile>, Vec<Failure>)> {
+    let (files, _, failed) = collect(client, course, known).await?;
     Ok((files, failed))
 }
+
+/// File lookups in flight at once within one course.
+const FILE_CONCURRENCY: usize = 6;
 
 /// Lists files and remembers, for each, the first module that links it.
 async fn collect(
     client: &Client,
     course: &Course,
+    known: &HashMap<u64, CanvasFile>,
 ) -> Result<(Vec<CanvasFile>, HashMap<u64, String>, Vec<Failure>)> {
     let mut module_of: HashMap<u64, String> = HashMap::new();
     let mut files: HashMap<u64, CanvasFile> = HashMap::new();
@@ -107,28 +127,44 @@ async fn collect(
         Err(Error::Forbidden(_) | Error::NotFound(_)) => Vec::new(),
         Err(e) => return Err(e),
     };
+    let mut wanted: Vec<(u64, String)> = Vec::new();
     for module in modules {
         for item in module.items.unwrap_or_default() {
             let Some(id) = item.content_id.filter(|_| item.kind == "File") else {
                 continue;
             };
             module_of.entry(id).or_insert_with(|| module.name.clone());
-            if files.contains_key(&id) {
+            if files.contains_key(&id) || wanted.iter().any(|(w, _)| *w == id) {
                 continue;
             }
-            match client.file(course.id, id).await {
-                Ok(f) => {
-                    files.insert(id, f);
+            match known.get(&id) {
+                Some(f) => {
+                    files.insert(id, f.clone());
                 }
-                Err(e @ Error::SessionExpired) => return Err(e),
-                Err(e) => failed.push(Failure {
-                    file_id: id,
-                    name: item.title,
-                    reason: e.to_string(),
-                }),
+                None => wanted.push((id, item.title)),
             }
         }
     }
+    use futures::StreamExt;
+    let fetched: Vec<(u64, String, Result<CanvasFile>)> = futures::stream::iter(wanted)
+        .map(|(id, title)| async move { (id, title, client.file(course.id, id).await) })
+        .buffer_unordered(FILE_CONCURRENCY)
+        .collect()
+        .await;
+    for (id, title, result) in fetched {
+        match result {
+            Ok(f) => {
+                files.insert(id, f);
+            }
+            Err(e @ Error::SessionExpired) => return Err(e),
+            Err(e) => failed.push(Failure {
+                file_id: id,
+                name: title,
+                reason: e.to_string(),
+            }),
+        }
+    }
+    failed.sort_by_key(|f| f.file_id);
     let mut files: Vec<CanvasFile> = files.into_values().collect();
     files.sort_by_key(|f| f.id);
     Ok((files, module_of, failed))
@@ -154,7 +190,7 @@ pub async fn sync_course(
     };
     std::fs::create_dir_all(root).map_err(io(root))?;
     let root = root.canonicalize().map_err(io(root))?;
-    let (files, module_of, failed) = collect(client, course).await?;
+    let (files, module_of, failed) = collect(client, course, &HashMap::new()).await?;
     let mut warnings = Vec::new();
     let folders: HashMap<u64, String> = match client.folders(course.id).await {
         Ok(list) => list.into_iter().map(|f| (f.id, f.full_name)).collect(),
