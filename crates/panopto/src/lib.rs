@@ -27,9 +27,11 @@
 //! The protocol was learned by studying the GPL-3.0
 //! `travbend/panopto-downloader` extension; no code was copied from it.
 
+mod course;
 mod download;
 mod transcript;
 
+pub use course::{RecapTargets, recap_targets};
 pub use download::{DownloadOptions, Downloaded, file_stem};
 pub use transcript::{Cue, Transcript, parse_srt, to_text};
 

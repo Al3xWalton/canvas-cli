@@ -44,7 +44,13 @@ async fn run() -> anyhow::Result<()> {
     let client = canvas_api::Client::new(&config, &session)?;
     // Fail before the handshake so the client marks the server as failed.
     let user = client.current_user().await?;
-    let service = server::CanvasServer::new(config, client, user)
+    // ReCap is optional: Canvas tools still work without Panopto cookies.
+    // Keep why ReCap is unavailable, so tools can say so accurately.
+    let recap = panopto::Panopto::new(&config, &session).map_err(|e| match e {
+        canvas_core::Error::SessionExpired => server::RecapUnavailable::SignedOut,
+        other => server::RecapUnavailable::Misconfigured(other.to_string()),
+    });
+    let service = server::CanvasServer::new(config, client, recap, user)
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;

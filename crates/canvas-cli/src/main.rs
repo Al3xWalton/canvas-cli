@@ -840,10 +840,8 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// Resolves a `recap` target to a folder and delivery IDs: a recording
-/// URL or ID goes to `<root>/ReCap`; anything else is a course, whose
-/// recordings (newest first, `latest` of them) go to
-/// `<root>/<course>/ReCap`.
+/// Resolves a `recap` target via [`panopto::recap_targets`], printing any
+/// warning.
 async fn recap_targets(
     config: &Config,
     recap: &panopto::Panopto,
@@ -851,41 +849,13 @@ async fn recap_targets(
     root: &std::path::Path,
     latest: Option<u64>,
 ) -> anyhow::Result<(std::path::PathBuf, Vec<String>)> {
-    if let Ok(id) = panopto::delivery_id(target) {
-        return Ok((root.join("ReCap"), vec![id]));
-    }
-    let client = client(config)?;
-    let course = canvas_api::resolve_course(&client, target).await?;
-    let code = course
-        .course_code
-        .as_deref()
-        .and_then(panopto::module_code)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "course {} has no module code to find its ReCap folder",
-                course.id
-            )
-        })?;
-    let term = course.term.as_ref().map(|t| t.name.as_str());
-    let found = recap.course_recordings(&code, term).await?;
-    if let Some(w) = &found.warning {
+    let canvas = client(config)?;
+    let latest = latest.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let t = panopto::recap_targets(&canvas, recap, target, root, latest).await?;
+    if let Some(w) = &t.warning {
         eprintln!("warning: {w}");
     }
-    let dir = root
-        .join(canvas_core::sanitize(
-            course.course_code.as_deref().unwrap_or(&course.name),
-        ))
-        .join("ReCap");
-    let take = latest.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
-    Ok((
-        dir,
-        found
-            .recordings
-            .into_iter()
-            .take(take)
-            .map(|r| r.id)
-            .collect(),
-    ))
+    Ok((t.dir, t.ids))
 }
 
 /// Builds an API client from the stored session.
