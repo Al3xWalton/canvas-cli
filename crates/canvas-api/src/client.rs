@@ -422,7 +422,10 @@ mod tests {
 
     #[test]
     fn no_canvas_cookie_means_session_expired() {
-        let config = Config::default();
+        let config = Config {
+            canvas_url: "https://canvas.example.edu".into(),
+            ..Config::default()
+        };
         let session = Session {
             captured_at: 0,
             cookies: vec![],

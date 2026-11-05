@@ -585,7 +585,10 @@ mod tests {
     }
 
     fn recap() -> Panopto {
-        let config = canvas_core::Config::default();
+        let config = canvas_core::Config {
+            panopto_host: "example.hosted.panopto.com".into(),
+            ..canvas_core::Config::default()
+        };
         let session = canvas_auth::Session {
             captured_at: 0,
             cookies: vec![canvas_auth::Cookie {

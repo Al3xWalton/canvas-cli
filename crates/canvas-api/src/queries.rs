@@ -203,7 +203,7 @@ mod tests {
         let err = pick_course(courses.clone(), "ABC10")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("matches 2 courses"), "{err}");
+        assert!(err.contains("matches 3 courses"), "{err}");
         assert!(pick_course(courses, "99").is_err());
     }
 

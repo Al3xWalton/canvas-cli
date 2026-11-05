@@ -37,14 +37,18 @@ and `canvas-mcp` to `~/.cargo/bin`
 make setup-signing && make install
 ```
 
+Tell it where your university's Canvas and ReCap are. It asks for both: your
+Canvas address, and the address of any recorded lecture (or just the ReCap host)
+
+```bash
+canvas setup
+```
+
 Sign in. A Chrome window opens for your university sign-in and MFA, then ReCap
 
 ```bash
 canvas auth login
 ```
-
-The defaults are for the university. For another university, set
-`canvas_url` and `panopto_host` in `~/.config/canvas-cli/config.toml`.
 
 See what's due
 
@@ -77,11 +81,15 @@ command for machine-readable output.
 - `recap download <recording|course> --latest N`: save lectures as MP4. Interrupted downloads resume.
 - `recap transcript <recording|course> [--language all]`: save `.srt` and readable `.txt` transcripts.
 - `recap file <course> --into <Lectures folder> --apply`: file recordings into your own `L01 - ...` lecture folders. Without `--apply` it only shows the plan.
+- `setup [--canvas-url <url>] [--recap-url <url>]`: set your Canvas and ReCap addresses.
 - `auth login [--recap-only] | status | logout`: manage the browser session, kept in the macOS keychain.
 - `--help`: see every option.
 
 ## Notes
 
+- **Provided as is.** It has only been tested at one university. Canvas and
+  Panopto are set up differently from one university to the next, so parts of
+  it may not work at yours. There is no warranty: see `LICENSE.md`.
 - Not affiliated with or endorsed by Instructure (Canvas) or Panopto. Use it
   only for content you can already access, and follow your university's
   policies on recordings.

@@ -39,7 +39,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let config = canvas_core::Config::load(&canvas_core::Config::default_path()?)?;
+    let config = canvas_core::Config::load(&canvas_core::Config::default_path()?)?.require()?;
     let session = canvas_auth::load()?;
     let client = canvas_api::Client::new(&config, &session)?;
     // Fail before the handshake so the client marks the server as failed.

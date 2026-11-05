@@ -325,7 +325,7 @@ mod tests {
         let chapters = std::collections::HashMap::from([
             (
                 "a".to_owned(),
-                vec!["Introduction To Second Example".to_owned()],
+                vec!["Introduction To Global Trade".to_owned()],
             ),
             ("b".to_owned(), vec!["Shareholder Theory".to_owned()]),
         ]);

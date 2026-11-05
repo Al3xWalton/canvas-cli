@@ -6,7 +6,7 @@
 //! module linking the file instead.
 //!
 //! - **Sources.** The course Files list when the user may see it, plus
-//!   every `File` item linked from a module. the university hides the Files list
+//!   every `File` item linked from a module. Many universities hide the Files list
 //!   from students, so modules are usually the only source.
 //! - **Incremental.** A manifest at `<root>/.canvas-sync/<course id>.json`
 //!   records each file's `updated_at` and size. A file is downloaded again

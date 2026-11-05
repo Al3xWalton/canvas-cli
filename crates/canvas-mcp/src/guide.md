@@ -1,6 +1,6 @@
 # Canvas CLI tools
 
-These tools read the user's university Canvas site (the university) and
+These tools read the user's university Canvas site and
 its Panopto ReCap lecture recordings. They are **read-only** on Canvas:
 nothing you call changes anything there. Download tools write only into the
 user's configured download root.

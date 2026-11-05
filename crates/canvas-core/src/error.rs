@@ -28,6 +28,11 @@ pub enum Error {
     /// No home or config directory could be found for this user.
     #[error("could not find a config directory for this user")]
     NoConfigDir,
+    /// The Canvas and ReCap addresses have not been set yet.
+    #[error(
+        "Canvas CLI is not set up yet. Run `canvas setup` to enter your Canvas and ReCap addresses."
+    )]
+    NotConfigured,
     /// No session is stored, or Canvas rejected the stored one.
     ///
     /// The message is the instruction a person or agent must follow: both

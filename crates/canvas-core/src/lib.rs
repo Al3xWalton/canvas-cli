@@ -13,6 +13,6 @@ mod config;
 mod error;
 mod names;
 
-pub use config::Config;
+pub use config::{Config, canvas_origin, recap_host};
 pub use error::{Error, Result};
 pub use names::sanitize;

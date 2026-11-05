@@ -1,6 +1,6 @@
 //! Course files and folders.
 //!
-//! Many courses (all of the university's, for students) refuse the Files list
+//! Many universities refuse the Files list to students
 //! with a 403 while still linking files from modules. Callers should
 //! treat [`Client::files`] as optional and fall back to module `File`
 //! items, fetching each with [`Client::file`].

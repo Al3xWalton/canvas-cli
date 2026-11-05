@@ -50,6 +50,15 @@ enum Command {
     /// Sign in, check or remove the stored browser session.
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Set your university's Canvas and ReCap addresses.
+    Setup {
+        /// Your Canvas address, e.g. https://canvas.example.edu
+        #[arg(long)]
+        canvas_url: Option<String>,
+        /// Your ReCap (Panopto) address: its host, or any ReCap link.
+        #[arg(long)]
+        recap_url: Option<String>,
+    },
     /// Show the active config file and settings.
     Config,
     /// Connect canvas-mcp to an agent client.
@@ -292,8 +301,32 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let path = Config::default_path()?;
-    let config = Config::load(&path)?;
+    let mut config = Config::load(&path)?;
+    match &cli.command {
+        // These work before setup.
+        Command::Setup { .. }
+        | Command::Config
+        | Command::Mcp(_)
+        | Command::Auth(AuthCommand::Logout) => {}
+        // Signing in needs the addresses: ask for them first.
+        Command::Auth(AuthCommand::Login { .. }) if !config.is_configured() => {
+            config = setup(config, &path, None, None)?;
+        }
+        _ => config = config.require()?,
+    }
     match cli.command {
+        Command::Setup {
+            canvas_url,
+            recap_url,
+        } => {
+            let config = setup(config, &path, canvas_url, recap_url)?;
+            if cli.json {
+                print_json(&serde_json::json!({ "path": path, "config": config }));
+            } else {
+                out!("Saved to {}.", path.display());
+                out!("Next: run `canvas auth login`.");
+            }
+        }
         Command::Config => {
             if cli.json {
                 print_json(&serde_json::json!({ "path": path, "config": config }));
@@ -1138,6 +1171,61 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Asks for (or takes) the Canvas and ReCap addresses, checks them, and
+/// saves the config. Values already set are offered as the default.
+fn setup(
+    mut config: Config,
+    path: &std::path::Path,
+    canvas_url: Option<String>,
+    recap_url: Option<String>,
+) -> anyhow::Result<Config> {
+    use std::io::{BufRead, IsTerminal};
+    let interactive = std::io::stdin().is_terminal();
+    let ask = |label: &str, hint: &str, current: &str| -> anyhow::Result<String> {
+        if !interactive {
+            anyhow::bail!(
+                "{label} is needed. Run `canvas setup --canvas-url <url> --recap-url <url>`."
+            );
+        }
+        eprintln!("{label}");
+        eprintln!("  {hint}");
+        if current.is_empty() {
+            eprint!("> ");
+        } else {
+            eprint!("[{current}] > ");
+        }
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        let line = line.trim();
+        Ok(if line.is_empty() {
+            current.to_owned()
+        } else {
+            line.to_owned()
+        })
+    };
+    let canvas = match canvas_url {
+        Some(v) => v,
+        None => ask(
+            "Your Canvas address",
+            "The address you open Canvas at, e.g. https://canvas.example.edu",
+            &config.canvas_url,
+        )?,
+    };
+    config.canvas_url = canvas_core::canvas_origin(&canvas)?;
+    let recap = match recap_url {
+        Some(v) => v,
+        None => ask(
+            "Your ReCap (Panopto) address",
+            "Open any recorded lecture and paste its address, or just the host, e.g. example.hosted.panopto.com",
+            &config.panopto_host,
+        )?,
+    };
+    config.panopto_host = canvas_core::recap_host(&recap)?;
+    config.save(path)?;
+    Ok(config)
 }
 
 /// Formats a byte count as B, KB, MB or GB.

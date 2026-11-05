@@ -71,7 +71,7 @@ impl Session {
     ///     captured_at: 0,
     ///     cookies: vec![Cookie {
     ///         name: "a".into(), value: "1".into(),
-    ///         domain: ".instructure.com".into(), path: "/".into(), expires: None,
+    ///         domain: ".example.edu".into(), path: "/".into(), expires: None,
     ///     }],
     /// };
     /// assert_eq!(session.cookie_header("canvas.example.edu").as_deref(), Some("a=1"));
@@ -280,7 +280,7 @@ mod tests {
         assert!(c.matches_host("example.hosted.panopto.com"));
         assert!(c.matches_host("panopto.com"));
         assert!(!c.matches_host("evilpanopto.com"));
-        assert!(!cookie("b", "canvas.example.edu", None).matches_host("instructure.com"));
+        assert!(!cookie("b", "canvas.example.edu", None).matches_host("example.edu"));
     }
 
     #[test]

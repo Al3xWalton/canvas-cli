@@ -56,19 +56,23 @@ Check that it worked:
 ~/.cargo/bin/canvas --version && ~/.cargo/bin/canvas-mcp --version
 ```
 
-## 5. Point it at the right university
+## 5. Point it at the user's university
 
-The defaults are the university (`https://canvas.example.edu` and
-`example.hosted.panopto.com`). Ask the user which Canvas site they use. If it is
-different, write `~/.config/canvas-cli/config.toml`:
+The tool has no built-in university. Ask the user for two addresses:
 
-```toml
-canvas_url = "https://<university>.instructure.com"
-panopto_host = "<university>.hosted.panopto.com"
-download_root = "/Users/<user>/Canvas"
+1. **Canvas:** the address they open Canvas at, e.g. `https://canvas.example.edu`.
+2. **ReCap (Panopto):** the address of any recorded lecture they can watch
+   (open one from a course's ReCap tab and copy the link), or just its host,
+   e.g. `example.hosted.panopto.com`.
+
+Then save them:
+
+```bash
+~/.cargo/bin/canvas setup --canvas-url "<canvas address>" --recap-url "<recap address>"
 ```
 
-Check the settings with `canvas config`.
+Check the settings with `~/.cargo/bin/canvas config`. Tell the user the tool
+has only been tested at one university and is provided as is.
 
 ## 6. Sign in (the user does this)
 

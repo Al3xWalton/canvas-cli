@@ -1,6 +1,6 @@
 //! Browser-session sign-in for Canvas and Panopto.
 //!
-//! the university students cannot create Canvas API tokens, so Canvas CLI
+//! Many universities do not let students create Canvas API tokens, so Canvas CLI
 //! borrows a real browser session instead:
 //!
 //! 1. [`login`] opens a visible Chrome window at the Canvas login page.
