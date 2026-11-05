@@ -32,6 +32,9 @@ pub struct LoginOptions {
     pub profile_dir: PathBuf,
     /// Whether to also sign in to Panopto ReCap.
     pub panopto: bool,
+    /// Whether to sign in to Canvas. `false` renews only ReCap, relying on
+    /// the kept Chrome profile's university sign-in.
+    pub canvas: bool,
 }
 
 impl Default for LoginOptions {
@@ -42,6 +45,7 @@ impl Default for LoginOptions {
                 .unwrap_or_else(std::env::temp_dir)
                 .join("canvas-cli/chrome-profile"),
             panopto: true,
+            canvas: true,
         }
     }
 }
@@ -88,16 +92,21 @@ pub async fn login(
             .await
             .map_err(|e| Error::Browser(e.to_string()))?;
 
-        progress("Sign in to Canvas in the Chrome window (SSO and MFA).");
-        wait_for_cookie(
-            &page,
-            &config.canvas_url,
-            CANVAS_COOKIE,
-            options.timeout,
-            |url| url.host_str() == Some(canvas_host.as_str()) && !url.path().starts_with("/login"),
-        )
-        .await?;
-        progress("Canvas signed in.");
+        if options.canvas {
+            progress("Sign in to Canvas in the Chrome window (SSO and MFA).");
+            wait_for_cookie(
+                &page,
+                &config.canvas_url,
+                CANVAS_COOKIE,
+                options.timeout,
+                |url| {
+                    url.host_str() == Some(canvas_host.as_str())
+                        && !url.path().starts_with("/login")
+                },
+            )
+            .await?;
+            progress("Canvas signed in.");
+        }
 
         let mut urls = vec![config.canvas_url.clone()];
         if options.panopto {

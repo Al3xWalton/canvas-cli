@@ -140,8 +140,11 @@ enum AuthCommand {
     /// Open Chrome, sign in to Canvas and ReCap, and store the session.
     Login {
         /// Skip the ReCap (Panopto) sign-in.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "recap_only")]
         no_recap: bool,
+        /// Renew only the ReCap sign-in, keeping the Canvas session.
+        #[arg(long)]
+        recap_only: bool,
         /// Seconds to wait for each sign-in step.
         #[arg(long, default_value_t = 300)]
         timeout: u64,
@@ -278,7 +281,34 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 out!("download_root  {}", config.download_root.display());
             }
         }
-        Command::Auth(AuthCommand::Login { no_recap, timeout }) => {
+        Command::Auth(AuthCommand::Login {
+            no_recap,
+            recap_only,
+            timeout,
+        }) => {
+            if recap_only {
+                // Fail early (before opening Chrome) if there is no session.
+                canvas_auth::load().map_err(|_| {
+                    anyhow::anyhow!("no stored session; run `canvas auth login` first")
+                })?;
+                let options = canvas_auth::LoginOptions {
+                    timeout: std::time::Duration::from_secs(timeout),
+                    canvas: false,
+                    ..Default::default()
+                };
+                let fresh = canvas_auth::login(&config, &options, |m| eprintln!("{m}")).await?;
+                // Re-read now: the stored session may have changed while the
+                // browser was open; only the ReCap cookies are replaced.
+                let mut session = canvas_auth::load()?;
+                session.replace_host(&config.panopto_host, &fresh);
+                canvas_auth::store(&session)?;
+                if cli.json {
+                    print_json(&serde_json::json!({ "recap_signed_in": true }));
+                } else {
+                    out!("ReCap signed in again. Canvas session kept.");
+                }
+                return Ok(());
+            }
             let options = canvas_auth::LoginOptions {
                 timeout: std::time::Duration::from_secs(timeout),
                 panopto: !no_recap,
@@ -472,7 +502,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let client = client(&config)?;
             let session = canvas_auth::load()?;
-            let recap = panopto::Panopto::new(&config, &session).ok();
+            let recap = panopto::Panopto::new(&config, &session)
+                .ok()
+                .map(|r| r.with_persistence(true));
             let now = chrono::Utc::now();
             let (since, from_marker) = canvas_digest::resolve_since(
                 &since,
@@ -547,7 +579,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     )
                 })?;
             let session = canvas_auth::load()?;
-            let recap = panopto::Panopto::new(&config, &session)?;
+            let recap = panopto::Panopto::new(&config, &session)?.with_persistence(true);
             let term = course.term.as_ref().map(|t| t.name.as_str());
             let result = recap.course_recordings(&code, term).await?;
             if cli.json {
@@ -579,7 +611,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             root,
         }) => {
             let session = canvas_auth::load()?;
-            let recap = panopto::Panopto::new(&config, &session)?;
+            let recap = panopto::Panopto::new(&config, &session)?.with_persistence(true);
             let root = root.unwrap_or_else(|| config.download_root.clone());
             let options = panopto::DownloadOptions { streams, no_mp4 };
             let (dir, ids) = recap_targets(&config, &recap, &target, &root, latest).await?;
@@ -635,7 +667,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             root,
         }) => {
             let session = canvas_auth::load()?;
-            let recap = panopto::Panopto::new(&config, &session)?;
+            let recap = panopto::Panopto::new(&config, &session)?.with_persistence(true);
             if stdout {
                 let id = panopto::delivery_id(&target)?;
                 let recording = recap.recording(&id).await?;
@@ -696,7 +728,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Recap(RecapCommand::Info { recording }) => {
             let session = canvas_auth::load()?;
-            let recap = panopto::Panopto::new(&config, &session)?;
+            let recap = panopto::Panopto::new(&config, &session)?.with_persistence(true);
             let r = recap.recording(&recording).await?;
             if cli.json {
                 print_json(&r);

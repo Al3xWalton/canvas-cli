@@ -101,6 +101,89 @@ impl Session {
         self.cookies.iter().any(|c| c.matches_host(host))
     }
 
+    /// Applies one `Set-Cookie` header received from `host`, as a browser
+    /// would. Returns true if the jar changed.
+    ///
+    /// The cookie is ignored if its `Domain` does not cover `host` (a server
+    /// may not set cookies for other sites). An empty value, `Max-Age=0` or
+    /// a past `Expires` deletes it.
+    ///
+    /// # Example
+    /// ```
+    /// use canvas_auth::Session;
+    /// let mut s = Session { captured_at: 0, cookies: vec![] };
+    /// assert!(s.apply_set_cookie(".ASPXAUTH=new; path=/; secure; HttpOnly", "example.hosted.panopto.com", 0));
+    /// assert_eq!(s.cookie_value("example.hosted.panopto.com", ".ASPXAUTH"), Some("new"));
+    /// ```
+    pub fn apply_set_cookie(&mut self, header: &str, host: &str, now_unix: i64) -> bool {
+        let mut parts = header.split(';').map(str::trim);
+        let Some((name, value)) = parts.next().and_then(|p| p.split_once('=')) else {
+            return false;
+        };
+        let (name, value) = (name.trim(), value.trim().trim_matches('"'));
+        if name.is_empty() {
+            return false;
+        }
+        let mut domain = host.to_owned();
+        let mut path = "/".to_owned();
+        let mut expires: Option<f64> = None;
+        let mut max_age: Option<i64> = None;
+        for attr in parts {
+            let (key, val) = attr
+                .split_once('=')
+                .map_or((attr, ""), |(k, v)| (k.trim(), v.trim()));
+            match key.to_ascii_lowercase().as_str() {
+                "domain" if !val.is_empty() => {
+                    domain = val.trim_start_matches('.').to_ascii_lowercase()
+                }
+                "path" if !val.is_empty() => path = val.to_owned(),
+                "max-age" => max_age = val.parse().ok(),
+                "expires" => expires = parse_http_date(val),
+                _ => {}
+            }
+        }
+        // A server may only set cookies for itself or a parent domain, and
+        // never for a bare top-level domain such as `eu`.
+        let allowed =
+            (host == domain || host.ends_with(&format!(".{domain}"))) && domain.contains('.');
+        if !allowed {
+            return false;
+        }
+        let expires = match max_age {
+            Some(secs) => Some((now_unix + secs) as f64),
+            None => expires,
+        };
+        let deleted = value.is_empty() || expires.is_some_and(|e| e <= now_unix as f64);
+        let same = |c: &Cookie| {
+            c.name == name && c.domain.trim_start_matches('.') == domain && c.path == path
+        };
+        let before = self.cookies.clone();
+        self.cookies.retain(|c| !same(c));
+        if !deleted {
+            self.cookies.push(Cookie {
+                name: name.to_owned(),
+                value: value.to_owned(),
+                domain,
+                path,
+                expires,
+            });
+        }
+        self.cookies != before
+    }
+
+    /// Replaces every cookie for `host` with those in `other`, keeping all
+    /// other hosts' cookies. Used to renew one site's login.
+    pub fn replace_host(&mut self, host: &str, other: &Session) {
+        self.cookies.retain(|c| !c.matches_host(host));
+        self.cookies.extend(
+            other
+                .cookies
+                .iter()
+                .filter(|c| c.matches_host(host))
+                .cloned(),
+        );
+    }
+
     /// Returns the earliest expiry (Unix seconds) among `host`'s cookies
     /// that have one, or `None` if all are browser-session cookies.
     pub fn earliest_expiry(&self, host: &str) -> Option<f64> {
@@ -110,6 +193,19 @@ impl Session {
             .filter_map(|c| c.expires)
             .reduce(f64::min)
     }
+}
+
+/// Parses an HTTP cookie date into Unix seconds.
+fn parse_http_date(text: &str) -> Option<f64> {
+    chrono::DateTime::parse_from_rfc2822(text)
+        .ok()
+        .or_else(|| chrono::DateTime::parse_from_str(text, "%a, %d-%b-%Y %H:%M:%S GMT").ok())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(text, "%a, %d-%b-%Y %H:%M:%S GMT")
+                .ok()
+                .map(|n| n.and_utc().fixed_offset())
+        })
+        .map(|t| t.timestamp() as f64)
 }
 
 fn entry() -> Result<keyring::Entry> {
@@ -185,6 +281,69 @@ mod tests {
         assert!(c.matches_host("panopto.com"));
         assert!(!c.matches_host("evilpanopto.com"));
         assert!(!cookie("b", "canvas.example.edu", None).matches_host("instructure.com"));
+    }
+
+    #[test]
+    fn set_cookie_replaces_deletes_and_refuses_other_sites() {
+        let host = "example.hosted.panopto.com";
+        let mut s = Session {
+            captured_at: 0,
+            cookies: vec![
+                cookie(".ASPXAUTH", host, None),
+                cookie("canvas_session", "canvas.example.edu", None),
+            ],
+        };
+        assert!(s.apply_set_cookie(
+            ".ASPXAUTH=fresh; expires=Thu, 05 Nov 2099 23:00:00 GMT; path=/; secure",
+            host,
+            1_000
+        ));
+        assert_eq!(s.cookie_value(host, ".ASPXAUTH"), Some("fresh"));
+        assert_eq!(
+            s.cookies.iter().filter(|c| c.name == ".ASPXAUTH").count(),
+            1,
+            "replaced, not duplicated"
+        );
+        assert!(s.earliest_expiry(host).is_some());
+        // Same value again: no change.
+        assert!(!s.apply_set_cookie(
+            ".ASPXAUTH=fresh; expires=Thu, 05 Nov 2099 23:00:00 GMT; path=/",
+            host,
+            1_000
+        ));
+        // Another site's domain is refused.
+        assert!(!s.apply_set_cookie("x=1; Domain=instructure.com", host, 1_000));
+        assert!(!s.apply_set_cookie("x=1; Domain=evilpanopto.com", host, 1_000));
+        assert!(!s.apply_set_cookie("x=1; Domain=com", host, 1_000));
+        // Max-Age=0 deletes.
+        assert!(s.apply_set_cookie(".ASPXAUTH=; Max-Age=0; path=/", host, 1_000));
+        assert_eq!(s.cookie_value(host, ".ASPXAUTH"), None);
+        assert_eq!(
+            s.cookie_value("canvas.example.edu", "canvas_session"),
+            Some("s3cret"),
+            "other hosts untouched"
+        );
+    }
+
+    #[test]
+    fn replace_host_keeps_other_hosts() {
+        let mut s = Session {
+            captured_at: 0,
+            cookies: vec![
+                cookie("a", "example.hosted.panopto.com", None),
+                cookie("b", "canvas.example.edu", None),
+            ],
+        };
+        let fresh = Session {
+            captured_at: 1,
+            cookies: vec![
+                cookie("c", "example.hosted.panopto.com", None),
+                cookie("d", "canvas.example.edu", None),
+            ],
+        };
+        s.replace_host("example.hosted.panopto.com", &fresh);
+        let names: Vec<_> = s.cookies.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["b", "c"]);
     }
 
     #[test]

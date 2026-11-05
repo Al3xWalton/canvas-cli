@@ -46,8 +46,10 @@ use serde::{Deserialize, Serialize};
 pub struct Panopto {
     pub(crate) http: reqwest::Client,
     host: String,
-    pub(crate) cookie: String,
-    csrf: Option<String>,
+    /// The live session. Panopto refreshes its auth cookie in responses;
+    /// those updates land here and, with persistence on, in the keychain.
+    session: std::sync::Arc<std::sync::Mutex<Session>>,
+    persist: bool,
 }
 
 /// One stream of a recording.
@@ -372,8 +374,9 @@ impl Panopto {
                 config.panopto_host
             )));
         }
-        let cookie = session.cookie_header(&host).ok_or(Error::SessionExpired)?;
-        let csrf = session.cookie_value(&host, "csrfToken").map(str::to_owned);
+        if !session.covers(&host) {
+            return Err(Error::SessionExpired);
+        }
         let http = reqwest::Client::builder()
             .user_agent(concat!("canvas-cli/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
@@ -384,9 +387,75 @@ impl Panopto {
         Ok(Self {
             http,
             host,
-            cookie,
-            csrf,
+            session: std::sync::Arc::new(std::sync::Mutex::new(session.clone())),
+            persist: false,
         })
+    }
+
+    /// Saves refreshed Panopto cookies to the keychain as they arrive, so
+    /// normal use keeps the ReCap login alive. Off by default (tests).
+    #[must_use]
+    pub fn with_persistence(mut self, persist: bool) -> Self {
+        self.persist = persist;
+        self
+    }
+
+    /// Builds the `Cookie` header from the current session.
+    pub(crate) fn cookie(&self) -> String {
+        self.session
+            .lock()
+            .map(|s| s.cookie_header(&self.host).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    fn csrf(&self) -> Option<String> {
+        self.session
+            .lock()
+            .ok()
+            .and_then(|s| s.cookie_value(&self.host, "csrfToken").map(str::to_owned))
+    }
+
+    /// Takes in any `Set-Cookie` headers from a Panopto response.
+    ///
+    /// They always update the in-memory session for this run. With
+    /// persistence on, and only for a successful response, they are also
+    /// saved: the keychain is **re-read** and just these headers are
+    /// replayed onto it, so a newer login made elsewhere (e.g. `canvas auth
+    /// login` while the MCP server runs) is never overwritten with stale
+    /// cookies. A change to `csrfToken` alone is not saved, since Panopto
+    /// issues a new one on each response anyway.
+    pub(crate) fn absorb(&self, headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) {
+        let now = chrono::Utc::now().timestamp();
+        let lines: Vec<String> = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let mut worth_saving = false;
+        if let Ok(mut session) = self.session.lock() {
+            for line in &lines {
+                let name = line.split('=').next().unwrap_or_default().trim();
+                if session.apply_set_cookie(line, &self.host, now) && name != "csrfToken" {
+                    worth_saving = true;
+                }
+            }
+        }
+        if !(worth_saving && self.persist && status.is_success()) {
+            return;
+        }
+        // Lock released above: merge into the current keychain copy.
+        if let Ok(mut stored) = canvas_auth::load() {
+            let mut changed = false;
+            for line in &lines {
+                changed |= stored.apply_set_cookie(line, &self.host, now);
+            }
+            if changed {
+                let _ = canvas_auth::store(&stored);
+            }
+        }
     }
 
     /// Returns the tenant's base URL. Only an exact loopback host (for
@@ -419,7 +488,7 @@ impl Panopto {
                 "{}/Panopto/Pages/Viewer/DeliveryInfo.aspx",
                 self.base()
             ))
-            .header(header::COOKIE, &self.cookie)
+            .header(header::COOKIE, self.cookie())
             .form(&[
                 ("deliveryId", id.as_str()),
                 ("isLiveNotes", "false"),
@@ -430,7 +499,7 @@ impl Panopto {
                 ("isEmbed", "false"),
                 ("responseType", "json"),
             ]);
-        if let Some(csrf) = &self.csrf {
+        if let Some(csrf) = self.csrf() {
             request = request.header("X-Csrf-Token", csrf);
         }
         let response = request
@@ -438,6 +507,7 @@ impl Panopto {
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
         let status = response.status();
+        self.absorb(response.headers(), status);
         if status.is_redirection() || status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(Error::SessionExpired);
         }
@@ -464,9 +534,9 @@ impl Panopto {
                 "{}/Panopto/Services/Data.svc/{method}",
                 self.base()
             ))
-            .header(header::COOKIE, &self.cookie)
+            .header(header::COOKIE, self.cookie())
             .json(body);
-        if let Some(csrf) = &self.csrf {
+        if let Some(csrf) = self.csrf() {
             request = request.header("X-Csrf-Token", csrf);
         }
         let response = request
@@ -474,6 +544,7 @@ impl Panopto {
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
         let status = response.status();
+        self.absorb(response.headers(), status);
         if status.is_redirection() || status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(Error::SessionExpired);
         }

@@ -174,11 +174,12 @@ impl Panopto {
         let response = self
             .http
             .get(url)
-            .header(header::COOKIE, &self.cookie)
+            .header(header::COOKIE, self.cookie())
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
         let status = response.status();
+        self.absorb(response.headers(), status);
         if status.is_redirection() || status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(Error::SessionExpired);
         }

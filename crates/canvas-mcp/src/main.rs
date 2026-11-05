@@ -46,10 +46,12 @@ async fn run() -> anyhow::Result<()> {
     let user = client.current_user().await?;
     // ReCap is optional: Canvas tools still work without Panopto cookies.
     // Keep why ReCap is unavailable, so tools can say so accurately.
-    let recap = panopto::Panopto::new(&config, &session).map_err(|e| match e {
-        canvas_core::Error::SessionExpired => server::RecapUnavailable::SignedOut,
-        other => server::RecapUnavailable::Misconfigured(other.to_string()),
-    });
+    let recap = panopto::Panopto::new(&config, &session)
+        .map(|r| r.with_persistence(true))
+        .map_err(|e| match e {
+            canvas_core::Error::SessionExpired => server::RecapUnavailable::SignedOut,
+            other => server::RecapUnavailable::Misconfigured(other.to_string()),
+        });
     let service = server::CanvasServer::new(config, client, recap, user)
         .serve(rmcp::transport::stdio())
         .await?;
