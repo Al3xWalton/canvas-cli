@@ -35,7 +35,7 @@ fn clean(text: &str) -> String {
 
 /// Read Canvas, download course files and ReCap lectures.
 #[derive(Debug, Parser)]
-#[command(name = "canvas", version, about)]
+#[command(name = "canvas", version = &**canvas_core::build::VERSION_LINE, about)]
 struct Cli {
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
@@ -61,6 +61,12 @@ enum Command {
     },
     /// Show the active config file and settings.
     Config,
+    /// Check for a newer canvas-cli, and install it with --apply.
+    Update {
+        /// Pull the newest code and rebuild (`git pull` + `make install`).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Connect canvas-mcp to an agent client.
     #[command(subcommand)]
     Mcp(McpCommand),
@@ -331,6 +337,58 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 out!("Saved to {}.", path.display());
                 out!("Next: run `canvas auth login`.");
+            }
+        }
+        Command::Update { apply } => {
+            let status = canvas_api::check_for_update().await;
+            if cli.json && !apply {
+                print_json(&status);
+            } else {
+                out!("Installed  {}", status.installed);
+                match status.behind_by {
+                    Some(0) => out!("Up to date."),
+                    Some(n) => {
+                        out!("{n} newer change(s) on GitHub:");
+                        for c in &status.changes {
+                            out!("  {c}");
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(e) = &status.error {
+                    out!("Note: {e}");
+                }
+            }
+            if apply {
+                if status.up_to_date == Some(true) {
+                    return Ok(());
+                }
+                let dir = std::path::Path::new(canvas_core::build::SOURCE_DIR);
+                if !dir.join(".git").exists() {
+                    anyhow::bail!(
+                        "the source folder {} is gone; follow https://github.com/{}/blob/main/UPDATE.md",
+                        dir.display(),
+                        canvas_core::build::REPO
+                    );
+                }
+                let run = |program: &str, args: &[&str]| -> anyhow::Result<()> {
+                    eprintln!("running {program} {} in {}", args.join(" "), dir.display());
+                    let ok = std::process::Command::new(program)
+                        .args(args)
+                        .current_dir(dir)
+                        .status()?
+                        .success();
+                    if !ok {
+                        anyhow::bail!(
+                            "`{program} {}` failed; nothing else was changed",
+                            args.join(" ")
+                        );
+                    }
+                    Ok(())
+                };
+                run("git", &["pull", "--ff-only", "origin", "main"])?;
+                run("make", &["install"])?;
+                out!("Updated. Reconnect the canvas MCP server in your agent to load it.");
             }
         }
         Command::Config => {

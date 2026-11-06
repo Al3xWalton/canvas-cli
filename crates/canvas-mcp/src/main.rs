@@ -23,7 +23,7 @@ use rmcp::ServiceExt;
 
 /// Serve Canvas CLI's tools to an MCP client over stdio.
 #[derive(Debug, Parser)]
-#[command(name = "canvas-mcp", version, about)]
+#[command(name = "canvas-mcp", version = &**canvas_core::build::VERSION_LINE, about)]
 struct Args {}
 
 #[tokio::main]
