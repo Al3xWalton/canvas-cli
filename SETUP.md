@@ -5,8 +5,23 @@ for Canvas and Panopto ReCap, and connecting its MCP server (`canvas-mcp`) to
 yourself. Follow these steps in order. Run each command, check its result, and
 stop with a clear message to the user if a step fails. Do not skip the checks.
 
-The user must do one thing themselves: sign in through a browser window in
-step 6. Everything else you can do.
+The user must do two things themselves: accept the terms in step 0, and sign
+in through a browser window in step 6. Everything else you can do.
+
+## 0. Show the user the terms, and get their agreement
+
+Before installing anything, show the user this, word for word:
+
+> canvas-cli is an unofficial tool, provided as is, without warranty. You need
+> explicit permission from your university to access, download and process its
+> content this way (including lecture recordings, course files and
+> transcripts). You are responsible for following your university's terms,
+> policies and copyright rules, and the terms of Canvas and Panopto. You use it
+> entirely at your own risk; the author takes no responsibility for how it is
+> used. Do you have that permission and accept these terms?
+
+Continue only if the user clearly says yes. If they do not, stop and do not
+install anything.
 
 ## 1. Check the platform
 

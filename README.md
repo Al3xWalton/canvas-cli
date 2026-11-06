@@ -15,6 +15,22 @@ nothing is ever submitted or changed on Canvas.
 Download and set up the unofficial Canvas CLI and its MCP server by following https://github.com/Al3xWalton/canvas-cli/blob/main/SETUP.md
 ```
 
+## Use at your own risk
+
+This is an unofficial tool, provided **as is, without warranty of any kind**.
+By using it you accept that:
+
+- **You need explicit permission from your university** to access, download
+  and process its content this way, including lecture recordings, course
+  files and transcripts. Get that permission before you use the tool.
+- You are responsible for following your university's terms, policies and
+  copyright rules, and the terms of Canvas (Instructure) and Panopto.
+- Downloaded content is for your own permitted use only. Do not share or
+  redistribute it.
+- **You use it entirely at your own risk.** The author takes no
+  responsibility for how it is used, or for any consequence of using it,
+  including action taken by your university or any other party.
+
 ## Requirements
 
 - macOS
