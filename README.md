@@ -15,6 +15,15 @@ nothing is ever submitted or changed on Canvas.
 Download and set up the unofficial Canvas CLI and its MCP server by following https://github.com/Al3xWalton/canvas-cli/blob/main/SETUP.md
 ```
 
+**Update it with an agent.** Paste this to get the newest version:
+
+```
+Update the unofficial Canvas CLI and its MCP server to the newest version by following https://github.com/Al3xWalton/canvas-cli/blob/main/UPDATE.md
+```
+
+Agents connected to `canvas-mcp` can also call its `update` tool, which
+returns the same steps.
+
 ## Use at your own risk
 
 This is an unofficial tool, provided **as is, without warranty of any kind**.
