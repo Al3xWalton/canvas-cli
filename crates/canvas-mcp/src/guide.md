@@ -12,6 +12,10 @@ name (`example studies`). An ambiguous name returns the candidates.
 - `auth_status`: who is signed in, and whether ReCap is signed in. Call it
   first in a long job.
 - `usage`: returns this guide.
+- `update`: the installed version and the steps to update canvas-cli to
+  the newest version. Follow them when the user asks to update. The
+  `steps` are built in; prefer the newer copy at `latest_steps_url` if you
+  can read it.
 
 ## Notifications
 - `digest` (`since` defaults to `last`, also a window like `2d`; `upcoming`
