@@ -9,6 +9,7 @@
 //! Neighbours: `canvas-auth`, `canvas-api`, `canvas-sync` and `panopto`
 //! read a [`Config`]; `canvas-cli` and `canvas-mcp` load it at start-up.
 
+pub mod build;
 mod config;
 mod error;
 mod names;

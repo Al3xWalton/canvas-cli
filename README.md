@@ -21,8 +21,9 @@ Download and set up the unofficial Canvas CLI and its MCP server by following ht
 Update the unofficial Canvas CLI and its MCP server to the newest version by following https://github.com/Al3xWalton/canvas-cli/blob/main/UPDATE.md
 ```
 
-Agents connected to `canvas-mcp` can also call its `update` tool, which
-returns the same steps.
+Or run `canvas update` to see what's new and `canvas update --apply` to
+install it. Agents connected to `canvas-mcp` can call its `update` tool,
+which checks for a newer version and returns the same steps.
 
 ## Use at your own risk
 

@@ -7,6 +7,17 @@ result, and stop with a clear message to the user if a step fails.
 The user's settings, sign-in and downloads are kept: updating replaces only
 the two programs.
 
+## Quick path
+
+Newer installs have a built-in updater. Try it first:
+
+```bash
+~/.cargo/bin/canvas update --apply
+```
+
+If it prints `Updated.` or `Up to date.`, skip to step 5. If the command
+does not exist (an older install) or fails, follow the steps below.
+
 ## 1. Find the code
 
 ```bash
