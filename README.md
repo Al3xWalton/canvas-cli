@@ -90,7 +90,7 @@ Name a course by id, code (`ABC1020`) or part of its name. Add `--json` to any
 command for machine-readable output.
 
 - `courses`, `assignments --due 7d`, `calendar --days 7d`, `grades [course]`: courses, deadlines, timetable and grades.
-- `announcements --since 14d`, `modules <course>`, `pages <course> [page]`, `discussions <course>`, `quizzes <course>`: course content as Markdown.
+- `announcements --since 14d`, `modules <course>`, `pages <course> [page] [--save]`, `discussions <course>`, `quizzes <course>`: course content as Markdown.
 - `digest`: what's new since the last run (announcements, assignments, files, recordings), plus what's due soon.
 - `files sync <course|--all>`: download new and changed course files to `~/Canvas`.
 - `recap list <course>`, `recap info <recording>`: a course's lecture recordings, with chapters.
