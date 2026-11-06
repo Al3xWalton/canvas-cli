@@ -12,8 +12,8 @@ fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
-/// Returns true for a Canvas page slug: ASCII letters, digits, `-`, `_`
-/// and `.`, starting with a letter or digit. This rules out `.`, `..`,
+/// Returns true for a Canvas page slug: ASCII letters, digits, `-`, `_`,
+/// `+` and `.`, starting with a letter or digit. This rules out `.`, `..`,
 /// `/`, `?` and `%`, so a slug can never change the request path.
 fn valid_slug(slug: &str) -> bool {
     slug.chars()
@@ -21,7 +21,7 @@ fn valid_slug(slug: &str) -> bool {
         .is_some_and(|c| c.is_ascii_alphanumeric())
         && slug
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
 }
 
 /// Courses per announcements request, keeping the URL short.
@@ -348,6 +348,7 @@ mod tests {
     fn slugs_cannot_change_the_path() {
         assert!(valid_slug("module-information-2"));
         assert!(valid_slug("week_1.notes"));
+        assert!(valid_slug("lgbtqa+-support"));
         for bad in ["", ".", "..", "../x", "a/b", "a?b=1", "%2e%2e", "a b", "-x"] {
             assert!(!valid_slug(bad), "{bad}");
         }
