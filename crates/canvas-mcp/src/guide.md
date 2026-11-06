@@ -40,6 +40,9 @@ name (`example studies`). An ambiguous name returns the candidates.
 - `list_pages` (`course`): often hidden from students; use `list_modules`
   instead.
 - `read_page` (`course`, `page`): one page as Markdown.
+- `save_pages` (`course`, optional `page`): save every page (or one) as
+  Markdown files in `<root>/<course>/<module>/`. Only when asked to keep
+  copies; use `read_page` to just read.
 - `list_announcements` (`within` defaults to `14d`, optional `course`).
 - `list_discussions` (`course`).
 - `list_files` (`course`) and `sync_files` (`course`): list files, or

@@ -80,12 +80,18 @@ enum Command {
         /// Course id, code (e.g. ABC1020) or part of the name.
         course: String,
     },
-    /// List a course's pages, or show one as Markdown.
+    /// List a course's pages, show one as Markdown, or save them to disk.
     Pages {
         /// Course id, code or part of the name.
         course: String,
-        /// Page url slug to show (from the list).
+        /// Page url slug to show or save (from the list or `modules --json`).
         page: Option<String>,
+        /// Save as Markdown files: this page, or every page if none is named.
+        #[arg(long)]
+        save: bool,
+        /// With --save, write here instead of the configured download_root.
+        #[arg(long, requires = "save")]
+        root: Option<std::path::PathBuf>,
     },
     /// List recent announcements.
     Announcements {
@@ -432,7 +438,43 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Pages { course, page } => {
+        Command::Pages {
+            course,
+            page,
+            save: true,
+            root,
+        } => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let root = root.unwrap_or_else(|| config.download_root.clone());
+            let quiet = cli.json;
+            let report =
+                canvas_sync::save_pages(&client, &course, &root, page.as_deref(), |path| {
+                    if !quiet {
+                        eprintln!("saving {path}");
+                    }
+                })
+                .await?;
+            if cli.json {
+                print_json(&report);
+            } else {
+                out!(
+                    "course {}: {} saved, {} unchanged, {} failed",
+                    report.course_id,
+                    report.saved.len(),
+                    report.unchanged,
+                    report.failed.len()
+                );
+                for f in &report.failed {
+                    out!("  failed: {} ({})", f.page, f.reason);
+                }
+                out!("Pages are in {}", root.display());
+            }
+            if !report.failed.is_empty() {
+                anyhow::bail!("{} page(s) could not be saved", report.failed.len());
+            }
+        }
+        Command::Pages { course, page, .. } => {
             let client = client(&config)?;
             let course = canvas_api::resolve_course(&client, &course).await?;
             match page {

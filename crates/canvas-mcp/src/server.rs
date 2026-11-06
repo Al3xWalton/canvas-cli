@@ -76,6 +76,16 @@ pub struct PageArgs {
     pub page: String,
 }
 
+/// A course's pages, or one of them.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct SavePagesArgs {
+    /// Course id, code or part of the name.
+    pub course: String,
+    /// Only this page slug (default: every page).
+    #[serde(default)]
+    pub page: Option<String>,
+}
+
 /// One ReCap recording.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct RecordingArgs {
@@ -370,6 +380,26 @@ impl CanvasServer {
         }
     }
 
+    /// Saves a course's pages as Markdown files.
+    #[tool(
+        description = "Save a course's pages (or one, by slug) as Markdown files in the download root (<root>/<course>/<module>/<title>.md). Returns paths; check `failed`."
+    )]
+    async fn save_pages(&self, Parameters(args): Parameters<SavePagesArgs>) -> CallToolResult {
+        match canvas_api::resolve_course(&self.client, &args.course).await {
+            Ok(c) => done(
+                canvas_sync::save_pages(
+                    &self.client,
+                    &c,
+                    &self.config.download_root,
+                    args.page.as_deref(),
+                    |_| {},
+                )
+                .await,
+            ),
+            Err(e) => fail(e),
+        }
+    }
+
     /// Lists a course's files.
     #[tool(
         description = "List a course's files (from the Files tab and modules) without downloading."
@@ -653,6 +683,7 @@ mod tests {
             "list_modules",
             "list_pages",
             "read_page",
+            "save_pages",
             "list_announcements",
             "list_discussions",
             "calendar",
@@ -679,6 +710,7 @@ mod tests {
             schemars::schema_for!(WindowArgs),
             schemars::schema_for!(OptionalCourseArgs),
             schemars::schema_for!(PageArgs),
+            schemars::schema_for!(SavePagesArgs),
             schemars::schema_for!(RecordingArgs),
             schemars::schema_for!(TranscriptArgs),
             schemars::schema_for!(RecapTargetArgs),

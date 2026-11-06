@@ -17,6 +17,8 @@
 //! - **Contained.** Every name from Canvas is sanitised, and the final
 //!   path is checked to be inside `root`, so a hostile name cannot write
 //!   elsewhere.
+//! - **Pages.** [`save_pages`] saves wiki pages as Markdown in the same
+//!   layout; see the `pages` module.
 //! - **Honest.** Files that could not be fetched are listed in
 //!   [`SyncReport::failed`]; callers must not report success when it is
 //!   non-empty.
@@ -30,6 +32,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use canvas_core::sanitize;
+pub use pages::{PageFailure, PagesReport, save_pages};
+
+mod pages;
 
 /// What one sync did.
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
