@@ -25,6 +25,7 @@ mod content;
 mod files;
 mod markdown;
 mod queries;
+mod release;
 mod types;
 
 pub use academic::{AssignmentGrade, CalendarEvent, CourseGrade, Quiz};
@@ -33,4 +34,5 @@ pub use content::{Announcement, Discussion, Module, ModuleItem, Page, PageSummar
 pub use files::{CanvasFile, Folder};
 pub use markdown::html_to_markdown;
 pub use queries::{UpcomingAssignment, parse_window, resolve_course, upcoming_assignments};
+pub use release::{UpdateStatus, check_for_update};
 pub use types::{Assignment, Course, Submission, Term, User};

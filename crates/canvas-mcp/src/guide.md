@@ -12,8 +12,10 @@ name (`example studies`). An ambiguous name returns the candidates.
 - `auth_status`: who is signed in, and whether ReCap is signed in. Call it
   first in a long job.
 - `usage`: returns this guide.
-- `update`: the installed version and the steps to update canvas-cli to
-  the newest version. Follow them when the user asks to update. The
+- `update`: whether a newer canvas-cli exists (`status.up_to_date`,
+  `behind_by`, `changes`) and the steps to update. When the user asks to
+  update, run `canvas update --apply` in a terminal (or follow `steps`),
+  then ask them to reconnect this server. The
   `steps` are built in; prefer the newer copy at `latest_steps_url` if you
   can read it.
 

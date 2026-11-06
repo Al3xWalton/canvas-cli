@@ -653,11 +653,13 @@ impl CanvasServer {
 
     /// Returns how to update canvas-cli to the newest version.
     #[tool(
-        description = "How to update canvas-cli and this MCP server to the newest version: the installed version, the update prompt and step-by-step instructions. Call when the user asks to update, or a tool seems missing."
+        description = "Check whether a newer canvas-cli exists (installed vs GitHub, with the list of changes) and return the steps to update it. Call when the user asks to update, or a tool seems missing."
     )]
     async fn update(&self) -> CallToolResult {
+        let status = canvas_api::check_for_update().await;
         ok(serde_json::json!({
-            "installed_version": env!("CARGO_PKG_VERSION"),
+            "status": status,
+            "one_command": "canvas update --apply",
             "prompt": UPDATE_PROMPT,
             "latest_steps_url": "https://github.com/Al3xWalton/canvas-cli/blob/main/UPDATE.md",
             "steps": UPDATE_STEPS,
