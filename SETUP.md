@@ -132,6 +132,12 @@ Once reconnected, call the `auth_status` tool. It should return
 Tell the user setup is done and suggest a first question, such as *"What's due
 in the next 7 days?"*
 
+## Updating later
+
+To update to the newest version, follow
+https://github.com/Al3xWalton/canvas-cli/blob/main/UPDATE.md, or call the
+`update` tool.
+
 ## If something fails later
 
 - `Canvas session expired or missing. Run canvas auth login.`: ask the user to

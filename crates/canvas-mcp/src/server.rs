@@ -20,6 +20,13 @@ use serde::Deserialize;
 /// The agent guide, sent as `instructions` and by the `usage` tool.
 pub const GUIDE: &str = include_str!("guide.md");
 
+/// The prompt a user pastes to update, shown in the README.
+pub const UPDATE_PROMPT: &str = "Update the unofficial Canvas CLI and its MCP server to the newest version by following https://github.com/Al3xWalton/canvas-cli/blob/main/UPDATE.md";
+
+/// The update steps, built into every version so an agent can update
+/// even if it cannot reach GitHub's web pages.
+pub const UPDATE_STEPS: &str = include_str!("../../../UPDATE.md");
+
 /// Most recordings one download or transcript call may fetch.
 const MAX_LATEST: usize = 10;
 
@@ -644,6 +651,19 @@ impl CanvasServer {
         }
     }
 
+    /// Returns how to update canvas-cli to the newest version.
+    #[tool(
+        description = "How to update canvas-cli and this MCP server to the newest version: the installed version, the update prompt and step-by-step instructions. Call when the user asks to update, or a tool seems missing."
+    )]
+    async fn update(&self) -> CallToolResult {
+        ok(serde_json::json!({
+            "installed_version": env!("CARGO_PKG_VERSION"),
+            "prompt": UPDATE_PROMPT,
+            "latest_steps_url": "https://github.com/Al3xWalton/canvas-cli/blob/main/UPDATE.md",
+            "steps": UPDATE_STEPS,
+        }))
+    }
+
     /// Returns the agent guide.
     #[tool(
         description = "Return the guide to these tools: what each does, recipes and error handling."
@@ -665,6 +685,16 @@ impl rmcp::ServerHandler for CanvasServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_prompt_matches_the_readme() {
+        let readme = include_str!("../../../README.md");
+        assert!(
+            readme.contains(UPDATE_PROMPT),
+            "README update prompt differs"
+        );
+        assert!(UPDATE_STEPS.contains("make install"));
+    }
 
     #[test]
     fn expired_session_reaches_the_agent_with_the_fix() {
@@ -696,6 +726,7 @@ mod tests {
             "get_transcript",
             "save_transcripts",
             "download_recordings",
+            "update",
         ] {
             assert!(GUIDE.contains(tool), "{tool} missing from guide");
         }
