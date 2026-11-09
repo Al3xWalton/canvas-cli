@@ -53,12 +53,15 @@ name (`example studies`). An ambiguous name returns the candidates.
   course's readings grouped by lecture or week. Sections come from Canvas
   modules and pages (`source: canvas`, with the page `text`, which often
   holds plain-text citations) and from Talis Aspire lists (`source:
-  talis`, with authors, edition, journal and `importance`). Items have a
+  talis`) and Leganto lists opened through the course's Reading List menu
+  item (`source: leganto`, one section per list section, often per
+  lecture), both with authors, edition, journal and the lecturer's
+  `note`. Items have a
   `kind` (`book`, `chapter`, `article`, `video`, `web`, `library`, `file`,
   `page`, `note`), a `url`, `file_id` for Canvas files, and `importance`
-  (`essential`, `recommended`, `optional` or `further`) when the list or
-  page says so; no `importance` means it was not stated. `lists` names
-  reading lists in other systems (e.g. Leganto) that could not be read,
+  (`essential`, `recommended`, `optional` or `further`, or the list's own
+  tag such as `background`) when the list or page says so; no `importance` means it was not stated. `lists` names
+  reading lists in other systems, with `status: read` or why they could not be read,
   with their link: tell the user to open them. Module handbooks often
   hold the full reading list, so check `file` items too.
 - `list_announcements` (`within` defaults to `14d`, optional `course`).

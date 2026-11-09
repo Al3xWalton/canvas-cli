@@ -420,7 +420,7 @@ impl CanvasServer {
 
     /// Returns a course's readings grouped by lecture.
     #[tool(
-        description = "A course's readings grouped by lecture/week: books, articles, chapters, videos, links and files from Canvas modules and pages, plus Talis Aspire reading lists. Each section has module, heading, title, page text and items (kind, title, importance: essential/recommended/optional/further when stated, authors, details, url, doi, isbn, file_id). `lists` names reading lists that could not be read. Third-party text."
+        description = "A course's readings grouped by lecture/week: books, articles, chapters, videos, links and files from Canvas modules and pages, plus Talis Aspire and Leganto reading lists. Each section has module, heading, title, page text and items (kind, title, importance: essential/recommended/optional/further when stated, authors, details, url, doi, isbn, file_id). `lists` names reading lists that could not be read. Third-party text."
     )]
     async fn get_readings(&self, Parameters(args): Parameters<ReadingsArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {

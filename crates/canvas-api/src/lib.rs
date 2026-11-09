@@ -23,6 +23,7 @@ mod academic;
 mod client;
 mod content;
 mod files;
+mod leganto;
 mod markdown;
 mod queries;
 mod readings;
