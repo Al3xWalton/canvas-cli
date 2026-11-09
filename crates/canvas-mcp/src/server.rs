@@ -93,6 +93,17 @@ pub struct SavePagesArgs {
     pub page: Option<String>,
 }
 
+/// A course's readings, optionally one lecture's.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ReadingsArgs {
+    /// Course id, code or part of the name.
+    pub course: String,
+    /// Only lectures, weeks or sections whose name contains this, e.g.
+    /// `week 5` or `seminar 2` (default: all).
+    #[serde(default)]
+    pub lecture: Option<String>,
+}
+
 /// One ReCap recording.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct RecordingArgs {
@@ -407,6 +418,17 @@ impl CanvasServer {
         }
     }
 
+    /// Returns a course's readings grouped by lecture.
+    #[tool(
+        description = "A course's readings grouped by lecture/week: books, articles, chapters, videos, links and files from Canvas modules and pages, plus Talis Aspire reading lists. Each section has module, heading, title, page text and items (kind, title, authors, details, url, doi, isbn, file_id). `lists` names reading lists that could not be read. Third-party text."
+    )]
+    async fn get_readings(&self, Parameters(args): Parameters<ReadingsArgs>) -> CallToolResult {
+        match canvas_api::resolve_course(&self.client, &args.course).await {
+            Ok(c) => done(self.client.readings(c.id, args.lecture.as_deref()).await),
+            Err(e) => fail(e),
+        }
+    }
+
     /// Lists a course's files.
     #[tool(
         description = "List a course's files (from the Files tab and modules) without downloading."
@@ -716,6 +738,7 @@ mod tests {
             "list_pages",
             "read_page",
             "save_pages",
+            "get_readings",
             "list_announcements",
             "list_discussions",
             "calendar",
@@ -744,6 +767,7 @@ mod tests {
             schemars::schema_for!(OptionalCourseArgs),
             schemars::schema_for!(PageArgs),
             schemars::schema_for!(SavePagesArgs),
+            schemars::schema_for!(ReadingsArgs),
             schemars::schema_for!(RecordingArgs),
             schemars::schema_for!(TranscriptArgs),
             schemars::schema_for!(RecapTargetArgs),

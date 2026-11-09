@@ -25,6 +25,7 @@ mod content;
 mod files;
 mod markdown;
 mod queries;
+mod readings;
 mod release;
 mod types;
 
@@ -34,5 +35,8 @@ pub use content::{Announcement, Discussion, Module, ModuleItem, Page, PageSummar
 pub use files::{CanvasFile, Folder};
 pub use markdown::html_to_markdown;
 pub use queries::{UpcomingAssignment, parse_window, resolve_course, upcoming_assignments};
+pub use readings::{
+    ExternalList, Reading, ReadingSection, Readings, from_canvas, read_talis, reading_pages,
+};
 pub use release::{UpdateStatus, check_for_update};
 pub use types::{Assignment, Course, Submission, Term, User};

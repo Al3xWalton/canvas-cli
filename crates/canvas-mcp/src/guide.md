@@ -49,6 +49,16 @@ name (`example studies`). An ambiguous name returns the candidates.
 - `save_pages` (`course`, optional `page`): save every page (or one) as
   Markdown files in `<root>/<course>/<module>/`. Only when asked to keep
   copies; use `read_page` to just read.
+- `get_readings` (`course`, optional `lecture` such as `week 5`): the
+  course's readings grouped by lecture or week. Sections come from Canvas
+  modules and pages (`source: canvas`, with the page `text`, which often
+  holds plain-text citations) and from Talis Aspire lists (`source:
+  talis`, with authors, edition, journal and `importance`). Items have a
+  `kind` (`book`, `chapter`, `article`, `video`, `web`, `library`, `file`,
+  `page`, `note`), a `url`, and `file_id` for Canvas files. `lists` names
+  reading lists in other systems (e.g. Leganto) that could not be read,
+  with their link: tell the user to open them. Module handbooks often
+  hold the full reading list, so check `file` items too.
 - `list_announcements` (`within` defaults to `14d`, optional `course`).
 - `list_discussions` (`course`).
 - `list_files` (`course`) and `sync_files` (`course`): list files, or
@@ -75,6 +85,10 @@ name (`example studies`). An ambiguous name returns the candidates.
   the ones with a `start_time` in the last 7 days, then call `get_transcript`
   for each. Structure the notes by its `## chapter` headings and cite the
   lecture title and date.
+- **Prepare for a lecture:** call `get_readings` with the course and
+  `lecture` (e.g. `week 5`), summarise each item with its link, and read
+  `text` for citations without links. Then use `get_transcript` for the
+  matching recording if it has happened.
 - **Daily notification:** call `digest` and report each `new_*` and
   `changed_assignments` item, then `upcoming`. Say "nothing new" when they
   are all empty.

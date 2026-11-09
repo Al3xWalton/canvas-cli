@@ -100,6 +100,7 @@ Name a course by id, code (`ABC1020`) or part of its name. Add `--json` to any
 command for machine-readable output.
 
 - `courses`, `assignments --due 7d`, `calendar --days 7d`, `grades [course]`: courses, deadlines, timetable and grades.
+- `readings <course> [--lecture "week 5"]`: each lecture's books, articles, videos and links, from Canvas modules and pages and Talis Aspire reading lists.
 - `announcements --since 14d`, `modules <course>`, `pages <course> [page] [--save]`, `discussions <course>`, `quizzes <course>`: course content as Markdown.
 - `digest`: what's new since the last run (announcements, assignments, files, recordings), plus what's due soon.
 - `files sync <course|--all>`: download new and changed course files to `~/Canvas`.
