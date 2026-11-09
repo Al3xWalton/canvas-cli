@@ -99,6 +99,14 @@ enum Command {
         #[arg(long, requires = "save")]
         root: Option<std::path::PathBuf>,
     },
+    /// Show a course's readings (books, articles, links, videos) by lecture.
+    Readings {
+        /// Course id, code or part of the name.
+        course: String,
+        /// Only lectures, weeks or sections whose name contains this, e.g. "week 5".
+        #[arg(long)]
+        lecture: Option<String>,
+    },
     /// List recent announcements.
     Announcements {
         /// How far back to look: a number with m, h, d or w.
@@ -554,6 +562,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+        }
+        Command::Readings { course, lecture } => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let readings = client.readings(course.id, lecture.as_deref()).await?;
+            if cli.json {
+                print_json(&readings);
+            } else {
+                print_readings(&readings);
             }
         }
         Command::Announcements { since, course } => {
@@ -1373,6 +1391,49 @@ async fn recap_targets(
 fn client(config: &Config) -> anyhow::Result<canvas_api::Client> {
     let session = canvas_auth::load()?;
     Ok(canvas_api::Client::new(config, &session)?)
+}
+
+/// Prints readings as Markdown, one heading per section.
+fn print_readings(r: &canvas_api::Readings) {
+    if r.sections.is_empty() {
+        out!("No readings found in this course's modules or reading lists.");
+    }
+    for s in &r.sections {
+        let path: Vec<&str> = [s.module.as_str(), s.heading.as_str(), s.title.as_str()]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect();
+        out!("## {}", path.join(" / "));
+        if let Some(page) = &s.page {
+            out!("(page: {page})");
+        }
+        for i in &s.items {
+            let mut line = format!("- [{}] {}", i.kind, i.title);
+            if !i.authors.is_empty() {
+                line.push_str(&format!(" by {}", i.authors.join(", ")));
+            }
+            if !i.details.is_empty() {
+                line.push_str(&format!(" ({})", i.details));
+            }
+            if let Some(imp) = &i.importance {
+                line.push_str(&format!(" [{imp}]"));
+            }
+            if let Some(url) = i.url.as_ref().filter(|u| **u != i.title) {
+                line.push_str(&format!(" <{url}>"));
+            }
+            out!("{line}");
+            if i.kind == "note" && i.note != i.title {
+                out!("  {}", i.note.replace('\n', "\n  "));
+            }
+        }
+        out!("");
+    }
+    for l in &r.lists {
+        out!("Reading list ({}): {} [{}]", l.system, l.url, l.status);
+    }
+    for w in &r.warnings {
+        out!("warning: {w}");
+    }
 }
 
 fn print_json(value: &impl Serialize) {

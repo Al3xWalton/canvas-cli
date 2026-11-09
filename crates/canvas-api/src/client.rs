@@ -316,7 +316,7 @@ fn next_link(header: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use canvas_auth::Cookie;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -334,7 +334,9 @@ mod tests {
     /// Serves `responses` in order, one per connection. `{base}` in a
     /// response is replaced with the server's own URL. The handle yields
     /// every raw request received.
-    async fn serve(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    pub(crate) async fn serve(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let me = base.clone();
@@ -355,7 +357,7 @@ mod tests {
         (base, handle)
     }
 
-    fn ok_json(body: &str, link: Option<&str>) -> String {
+    pub(crate) fn ok_json(body: &str, link: Option<&str>) -> String {
         let link = link.map(|l| format!("Link: {l}\r\n")).unwrap_or_default();
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{link}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -363,7 +365,7 @@ mod tests {
         )
     }
 
-    fn client(base: &str) -> Client {
+    pub(crate) fn client(base: &str) -> Client {
         let config = Config {
             canvas_url: base.to_owned(),
             ..Config::default()
