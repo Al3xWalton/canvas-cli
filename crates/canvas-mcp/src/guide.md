@@ -55,7 +55,9 @@ name (`example studies`). An ambiguous name returns the candidates.
   holds plain-text citations) and from Talis Aspire lists (`source:
   talis`, with authors, edition, journal and `importance`). Items have a
   `kind` (`book`, `chapter`, `article`, `video`, `web`, `library`, `file`,
-  `page`, `note`), a `url`, and `file_id` for Canvas files. `lists` names
+  `page`, `note`), a `url`, `file_id` for Canvas files, and `importance`
+  (`essential`, `recommended`, `optional` or `further`) when the list or
+  page says so; no `importance` means it was not stated. `lists` names
   reading lists in other systems (e.g. Leganto) that could not be read,
   with their link: tell the user to open them. Module handbooks often
   hold the full reading list, so check `file` items too.

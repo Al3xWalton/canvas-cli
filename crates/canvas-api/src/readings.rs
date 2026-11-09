@@ -325,52 +325,162 @@ pub fn talis_list_id(url: &str) -> Option<String> {
         .map(|m| m.as_str().to_uppercase())
 }
 
+/// The importance a phrase gives a reading: `essential`, `recommended`,
+/// `optional` or `further`, or `None` if it says nothing. When several
+/// apply (`optional/recommended`) the strongest wins.
+pub fn importance_in(text: &str) -> Option<&'static str> {
+    let t = text.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
+    if has(&[
+        "essential",
+        "required",
+        "compulsory",
+        "mandatory",
+        "core read",
+        "core text",
+        "must read",
+        "must-read",
+        "key read",
+        "key text",
+        "set text",
+    ]) {
+        Some("essential")
+    } else if has(&["recommended", "suggested", "highly advised"]) {
+        Some("recommended")
+    } else if has(&["optional", "if you have time", "if interested"]) {
+        Some("optional")
+    } else if has(&[
+        "further read",
+        "additional read",
+        "wider read",
+        "extra read",
+        "background read",
+        "supplementary",
+        "going further",
+    ]) {
+        // "Textbook and additional readings" covers both: say nothing.
+        (!has(&["textbook", "core"])).then_some("further")
+    } else {
+        None
+    }
+}
+
+/// The text of a Markdown heading line (`## Week 5`, or a line that is
+/// all bold), without its markup.
+fn heading_text(line: &str) -> Option<String> {
+    let l = line.trim();
+    let text = if l.starts_with('#') {
+        l.trim_start_matches('#')
+    } else if l.len() > 4 && l.starts_with("**") && l.ends_with("**") && !l.contains("](") {
+        &l[2..l.len() - 2]
+    } else {
+        return None;
+    };
+    let text = text.replace('\\', "");
+    let text = text.trim().trim_matches(['*', '_', ':']).trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 /// Turns a page's Markdown into reading items, one per distinct link.
 /// Images, mail links and in-page anchors are skipped.
+///
+/// Each link's importance comes from its own line, else the heading
+/// above it. A link whose text is empty or the bare URL takes the nearest
+/// heading as its title.
 pub fn links_in(markdown: &str) -> Vec<Reading> {
-    let mut out: Vec<Reading> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    let mut push = |title: &str, url: &str| {
-        let url = url.trim_end_matches(['.', ',', ';']);
-        if !url.starts_with("http") || seen.iter().any(|s| s == url) {
-            return;
-        }
-        seen.push(url.to_owned());
-        let title = title.replace('\\', "");
-        let title = title.trim().trim_matches(['*', '_']).trim();
-        let title = if title.is_empty() { url } else { title };
-        out.push(Reading {
-            title: title.to_owned(),
-            file_id: canvas_file_id(url),
-            kind: classify(url, title).to_owned(),
-            url: Some(url.to_owned()),
-            doi: DOI
-                .as_ref()
-                .and_then(|re| re.captures(url))
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_owned()),
-            ..Default::default()
-        });
-    };
     let markdown = match LINKED_IMAGE.as_ref() {
         Some(re) => re.replace_all(markdown, "[$1](").into_owned(),
         None => markdown.to_owned(),
     };
-    let markdown = markdown.as_str();
-    let mut rest = markdown.to_owned();
-    if let Some(re) = MD_LINK.as_ref() {
-        for c in re.captures_iter(markdown) {
-            if c.get(1).is_some_and(|m| m.as_str() == "!") {
+    let mut out: Vec<Reading> = Vec::new();
+    let mut heading: Option<String> = None;
+    let mut heading_importance: Option<&'static str> = None;
+    // Links seen before the first heading after them, whose title is
+    // still their URL: a heading just below a bare link often names it.
+    let mut untitled: Vec<usize> = Vec::new();
+    for line in markdown.lines() {
+        if let Some(h) = heading_text(line) {
+            heading_importance = importance_in(&h);
+            for &i in &untitled {
+                if let Some(r) = out.get_mut(i)
+                    && r.url.as_deref() == Some(r.title.as_str())
+                {
+                    r.title.clone_from(&h);
+                }
+            }
+            untitled.clear();
+            heading = Some(h);
+            continue;
+        }
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut rest = line.to_owned();
+        if let Some(re) = MD_LINK.as_ref() {
+            for c in re.captures_iter(line) {
+                if c.get(1).is_some_and(|m| m.as_str() == "!") {
+                    continue;
+                }
+                let text = c.get(2).map_or("", |m| m.as_str());
+                found.push((
+                    text.to_owned(),
+                    c.get(3).map_or("", |m| m.as_str()).to_owned(),
+                ));
+            }
+            rest = re.replace_all(line, " ").into_owned();
+        }
+        if let Some(re) = BARE_URL.as_ref() {
+            for m in re.find_iter(&rest) {
+                found.push((String::new(), m.as_str().to_owned()));
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        let line_words = BARE_URL.as_ref().map_or_else(
+            || line.to_owned(),
+            |re| re.replace_all(line, " ").into_owned(),
+        );
+        let importance = importance_in(&line_words).or(heading_importance);
+        for (text, url) in found {
+            let url = url.trim_end_matches(['.', ',', ';']);
+            if !url.starts_with("http") {
                 continue;
             }
-            let text = c.get(2).map_or("", |m| m.as_str());
-            push(text, c.get(3).map_or("", |m| m.as_str()));
-        }
-        rest = re.replace_all(markdown, " ").into_owned();
-    }
-    if let Some(re) = BARE_URL.as_ref() {
-        for m in re.find_iter(&rest) {
-            push("", m.as_str());
+            let title = text.replace('\\', "");
+            let title = title.trim().trim_matches(['*', '_']).trim();
+            let bare = title.is_empty() || title == url;
+            if let Some(i) = out.iter().position(|r| r.url.as_deref() == Some(url)) {
+                // Seen before: keep the first, but take a better title.
+                if let Some(r) = out.get_mut(i) {
+                    if r.title == url {
+                        if !bare {
+                            r.title = title.to_owned();
+                        } else if let Some(h) = &heading {
+                            r.title.clone_from(h);
+                        }
+                    }
+                    if r.importance.is_none() {
+                        r.importance = importance.map(str::to_owned);
+                    }
+                }
+                continue;
+            }
+            let title = if bare { url } else { title };
+            if bare {
+                untitled.push(out.len());
+            }
+            out.push(Reading {
+                title: title.to_owned(),
+                file_id: canvas_file_id(url),
+                kind: classify(url, title).to_owned(),
+                url: Some(url.to_owned()),
+                doi: DOI
+                    .as_ref()
+                    .and_then(|re| re.captures(url))
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_owned()),
+                importance: importance.map(str::to_owned),
+                ..Default::default()
+            });
         }
     }
     out
@@ -477,6 +587,16 @@ fn canvas_sections(picked: &[Picked], pages: &HashMap<String, Page>) -> Vec<Read
                 url: item.html_url.clone(),
                 ..Default::default()
             }),
+        }
+        // Items the page did not mark take the page title, item title or
+        // module heading's word for it.
+        let context = importance_in(&section.title)
+            .or_else(|| importance_in(&item.title))
+            .or_else(|| importance_in(&section.heading));
+        for r in &mut section.items {
+            if r.importance.is_none() {
+                r.importance = context.map(str::to_owned);
+            }
         }
         // Merge consecutive items of the same heading into one section.
         match sections.last_mut() {
@@ -965,6 +1085,7 @@ fn talis_item(g: &Graph, item_uri: &str, base: &str) -> Reading {
                 .unwrap_or_default()
                 .replace("implicit-", "")
         })
+        .map(|i| importance_in(&i).map_or(i, str::to_owned))
         .filter(|i| !i.is_empty());
     let online = values(g, &resource, "onlineResource")
         .first()
@@ -1069,6 +1190,44 @@ mod tests {
         assert_eq!(more[0].title, "PwC");
         assert_eq!(more[1].kind, "file");
         assert_eq!(more[1].file_id, Some(42));
+    }
+
+    #[test]
+    fn importance_from_words() {
+        assert_eq!(
+            importance_in("Pre-lecture video (optional /recommended)"),
+            Some("recommended")
+        );
+        assert_eq!(importance_in("Essential reading"), Some("essential"));
+        assert_eq!(importance_in("Required: chapter 3"), Some("essential"));
+        assert_eq!(
+            importance_in("Lecture 2 - Additional Reading"),
+            Some("further")
+        );
+        assert_eq!(importance_in("Optional"), Some("optional"));
+        assert_eq!(importance_in("Week 5"), None);
+        assert_eq!(importance_in("Textbook and Additional Readings"), None);
+    }
+
+    #[test]
+    fn links_take_importance_from_line_or_heading() {
+        let md = "## Essential reading\n\n[Smith 2020](https://a.example/1)\n\n\
+                  ## Further reading\n\n[Jones](https://a.example/2)\n\n\
+                  Optional: [Lee](https://a.example/3)";
+        let links = links_in(md);
+        let imp: Vec<_> = links.iter().map(|r| r.importance.as_deref()).collect();
+        assert_eq!(imp, [Some("essential"), Some("further"), Some("optional")]);
+    }
+
+    #[test]
+    fn bare_links_take_the_nearby_heading_as_title() {
+        let md = "[](https://iptv.example/View.aspx?id=1)\n\n\
+                  ### The Secret Genius of Modern Life\n\n\
+                  Follow the link:\n\n\
+                  [https://iptv.example/View.aspx?id=1](https://iptv.example/View.aspx?id=1)";
+        let links = links_in(md);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].title, "The Secret Genius of Modern Life");
     }
 
     #[test]
