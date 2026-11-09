@@ -18,9 +18,12 @@ const MAX_WAIT_SECS: u64 = 60;
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
-    base: url::Url,
+    pub(crate) base: url::Url,
     cookie: String,
     backoff: std::time::Duration,
+    /// The whole session, used only as the starting cookie jar for LTI
+    /// launches (see `leganto`). Never logged or returned.
+    pub(crate) session: Session,
 }
 
 impl Client {
@@ -59,6 +62,7 @@ impl Client {
             base,
             cookie,
             backoff: std::time::Duration::from_secs(1),
+            session: session.clone(),
         })
     }
 

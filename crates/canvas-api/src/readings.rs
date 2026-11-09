@@ -11,7 +11,11 @@
 //! - **Talis Aspire.** Lists linked from Canvas are read through Talis's
 //!   public linked-data JSON (`/lists/<id>.json`), section by section.
 //!   No sign-in is needed.
-//! - **Everything else** (Leganto, other systems, course-menu tools) is
+//! - **Leganto.** A course-menu reading-list tool is opened through
+//!   Canvas (LTI 1.3) with the user's session, and each Leganto list it
+//!   reaches is read section by section, with tags (Essential,
+//!   Recommended...) and the lecturer's notes. See `leganto.rs`.
+//! - **Everything else** (other systems, tools that are not Leganto) is
 //!   returned in [`Readings::lists`] with its link and the reason it was
 //!   not read, so an agent can tell the user where to look.
 //!
@@ -338,6 +342,7 @@ pub fn importance_in(text: &str) -> Option<&'static str> {
         "mandatory",
         "core read",
         "core text",
+        "main text",
         "must read",
         "must-read",
         "key read",
@@ -686,11 +691,12 @@ fn find_lists(sections: &[ReadingSection], tabs: &[Value]) -> Vec<ExternalList> 
         } else {
             "course-tool"
         };
+        // Course tools are opened through Canvas (LTI) by the caller.
         out.push(ExternalList {
             system: system.into(),
             url,
             found_in: format!("course menu: {label}"),
-            status: "opens through a Canvas tool (LTI) that needs a browser sign-in; open the link in Canvas".into(),
+            status: String::new(),
         });
     }
     out
@@ -773,8 +779,27 @@ impl Client {
                     }
                     Err(e) => list.status = format!("could not read the Talis list: {e}"),
                 },
+                "leganto" | "course-tool" if list.url.contains("/external_tools/") => {
+                    match self.read_leganto(&list.url).await {
+                        Ok(sections) => {
+                            "leganto".clone_into(&mut list.system);
+                            list.status = if sections.is_empty() {
+                                "read: the list is empty".into()
+                            } else {
+                                "read".into()
+                            };
+                            out.sections.extend(sections);
+                        }
+                        Err(e @ Error::SessionExpired) => return Err(e),
+                        Err(e) => {
+                            list.status = format!(
+                                "could not open this course tool as a Leganto list ({e}); open the link in Canvas"
+                            );
+                        }
+                    }
+                }
                 "leganto" => {
-                    list.status = "Leganto lists need a university sign-in and are not read yet; open the link".into();
+                    list.status = "Leganto list linked directly; open it through the course's Reading List menu item, or open the link".into();
                 }
                 _ => list.status = "unknown reading-list system; open the link".into(),
             }
@@ -787,6 +812,23 @@ impl Client {
                     || s.heading.to_lowercase().contains(&f)
                     || s.title.to_lowercase().contains(&f)
             });
+        }
+        Ok(out)
+    }
+}
+
+impl Client {
+    /// Opens a course-menu tool through Canvas and, if it is Leganto,
+    /// reads every list it reaches.
+    async fn read_leganto(&self, tool_url: &str) -> Result<Vec<ReadingSection>> {
+        let launched = self.launch_leganto(tool_url).await?;
+        if launched.list_ids.is_empty() {
+            return Err(Error::Http("Leganto opened but showed no list".into()));
+        }
+        let mut out = Vec::new();
+        for id in launched.list_ids.iter().take(5) {
+            let (_, sections) = launched.read_list(id).await?;
+            out.extend(sections);
         }
         Ok(out)
     }
@@ -1326,8 +1368,10 @@ mod tests {
         assert_eq!(s.items[0].doi.as_deref(), Some("10.1000/abc"));
         assert_eq!(r.lists.len(), 2, "{:?}", r.lists);
         assert_eq!(r.lists[0].system, "leganto");
-        assert!(r.lists[0].status.contains("sign-in"));
+        assert!(r.lists[0].status.contains("Reading List menu"));
+        // The tool is on another host than this Canvas, so it is not launched.
         assert_eq!(r.lists[1].system, "course-tool");
+        assert!(r.lists[1].status.contains("could not open"));
         assert!(r.lists.iter().all(|l| !l.status.is_empty()));
     }
 }

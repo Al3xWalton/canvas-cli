@@ -1422,7 +1422,7 @@ fn print_readings(r: &canvas_api::Readings) {
                 line.push_str(&format!(" <{url}>"));
             }
             out!("{line}");
-            if i.kind == "note" && i.note != i.title {
+            if !i.note.is_empty() && i.note != i.title {
                 out!("  {}", i.note.replace('\n', "\n  "));
             }
         }
