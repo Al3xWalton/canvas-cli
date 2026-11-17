@@ -27,5 +27,8 @@ serde_json.workspace = true
 chrono.workspace = true
 rmcp = { version = "3.9", features = ["server", "transport-io", "macros"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util"] }
+
 [lints]
 workspace = true

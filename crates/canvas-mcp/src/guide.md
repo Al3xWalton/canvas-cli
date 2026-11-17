@@ -8,6 +8,10 @@ user's configured download root.
 Wherever a tool takes `course`, pass an id, a code (`ABC1020`) or part of the
 name (`example studies`). An ambiguous name returns the candidates.
 
+Every structured result is a JSON object. A list comes back under a key
+named for its contents, e.g. `list_courses` returns `{"courses": [...]}`;
+each list tool below names its key.
+
 ## Account
 - `auth_status`: who is signed in, and whether ReCap is signed in. Call it
   first in a long job.
@@ -30,28 +34,29 @@ name (`example studies`). An ambiguous name returns the candidates.
 
 ## Deadlines and timetable
 - `list_assignments` (`within` defaults to `7d`; also `48h`, `2w`; optional
-  `course`): due soonest first, each with `due_at` (RFC 3339 UTC),
-  `submitted`, `points_possible` and `html_url`.
-- `calendar` (`within` defaults to `7d`, optional `course`): timetabled events
-  and dated assignments, with rooms.
-- `list_quizzes` (`course`): classic quizzes. New Quizzes are listed by
-  `list_assignments`.
-- `grades` (optional `course`): course totals, or one course's per-assignment
-  results. `hidden: true` means the course hides totals.
+  `course`): `assignments`, due soonest first, each with `due_at` (RFC 3339
+  UTC), `submitted`, `points_possible` and `html_url`.
+- `calendar` (`within` defaults to `7d`, optional `course`): `events`,
+  timetabled events and dated assignments, with rooms.
+- `list_quizzes` (`course`): `quizzes`, the classic quizzes. New Quizzes are
+  listed by `list_assignments`.
+- `grades` (optional `course`): `grades`, course totals, or one course's
+  per-assignment results. `hidden: true` means the course hides totals.
 
 ## Course content
-- `list_courses`: active courses (`id`, `course_code`, `name`, `term`).
-- `list_modules` (`course`): modules in order with their items. `Page` items
-  carry a `page_url` for `read_page`.
-- `list_pages` (`course`): often hidden from students; use `list_modules`
-  instead.
+- `list_courses`: `courses`, the active courses (`id`, `course_code`, `name`,
+  `term`).
+- `list_modules` (`course`): `modules` in order with their items. `Page`
+  items carry a `page_url` for `read_page`.
+- `list_pages` (`course`): `pages`. Often hidden from students; use
+  `list_modules` instead.
 - `read_page` (`course`, `page`): one page as Markdown.
 - `save_pages` (`course`, optional `page`): save every page (or one) as
   Markdown files in `<root>/<course>/<module>/`. Only when asked to keep
   copies; use `read_page` to just read.
 - `get_readings` (`course`, optional `lecture` such as `week 5`): the
-  course's readings grouped by lecture or week. Sections come from Canvas
-  modules and pages (`source: canvas`, with the page `text`, which often
+  course's readings grouped by lecture or week, as `sections`. Sections
+  come from Canvas modules and pages (`source: canvas`, with the page `text`, which often
   holds plain-text citations) and from Talis Aspire lists (`source:
   talis`) and Leganto lists opened through the course's Reading List menu
   item (`source: leganto`, one section per list section, often per
@@ -64,14 +69,17 @@ name (`example studies`). An ambiguous name returns the candidates.
   reading lists in other systems, with `status: read` or why they could not be read,
   with their link: tell the user to open them. Module handbooks often
   hold the full reading list, so check `file` items too.
-- `list_announcements` (`within` defaults to `14d`, optional `course`).
-- `list_discussions` (`course`).
-- `list_files` (`course`) and `sync_files` (`course`): list files, or
-  download new and changed ones to `<root>/<course>/<module>/`.
+- `list_announcements` (`within` defaults to `14d`, optional `course`):
+  `announcements`, newest first.
+- `list_discussions` (`course`): `discussions`.
+- `list_files` (`course`) and `sync_files` (`course`): list `files` (with
+  `failed`), or download new and changed ones to `<root>/<course>/<module>/`
+  (`downloaded`, with `failed`).
 
 ## Lectures (ReCap)
-- `list_recordings` (`course`): newest first, with `id`, `title`,
-  `start_time`, `duration_secs` and `has_captions`.
+- `list_recordings` (`course`): `recordings`, newest first, with `id`,
+  `title`, `start_time`, `duration_secs` and `has_captions`; also `folders`
+  and a `warning` when the match is broader than asked.
 - `recording_info` (`recording`): length, chapters, captions and their
   `caption_languages`, `has_mp4` and stream kinds. Download links are never returned.
 - `get_transcript` (`recording`, optional `language` code): the lecture as readable text with
@@ -84,11 +92,11 @@ name (`example studies`). An ambiguous name returns the candidates.
 
 ## Recipes
 - **Assessment reminder:** call `list_assignments` with `within: "7d"` and keep
-  the ones with `submitted: false`. Quote `due_at` in the user's local time and
-  include `html_url`.
+  the `assignments` with `submitted: false`. Quote `due_at` in the user's
+  local time and include `html_url`.
 - **This week's lecture notes:** call `list_recordings` for the course, take
-  the ones with a `start_time` in the last 7 days, then call `get_transcript`
-  for each. Structure the notes by its `## chapter` headings and cite the
+  the `recordings` with a `start_time` in the last 7 days, then call
+  `get_transcript` for each. Structure the notes by its `## chapter` headings and cite the
   lecture title and date.
 - **Prepare for a lecture:** call `get_readings` with the course and
   `lecture` (e.g. `week 5`), summarise each item with its link, and read
