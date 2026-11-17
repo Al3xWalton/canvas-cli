@@ -1,9 +1,12 @@
 //! The MCP tool definitions.
 //!
 //! Each tool is a thin wrapper over the same library call the matching CLI
-//! command makes. Results are structured JSON. Failures become MCP tool
-//! errors (not protocol errors) so the agent reads the message, including
-//! the `canvas auth login` instruction when the session has expired.
+//! command makes. Structured results are JSON objects: MCP requires
+//! `structuredContent` to be an object and strict clients reject anything
+//! else, so a list comes back under a key named for its contents
+//! (`{"courses": [...]}`). Failures become MCP tool errors (not protocol
+//! errors) so the agent reads the message, including the
+//! `canvas auth login` instruction when the session has expired.
 //!
 //! No tool takes a file path. Everything written goes under the configured
 //! `download_root`, in the same layout the CLI uses, so tool arguments can
@@ -167,11 +170,26 @@ pub struct DigestArgs {
 }
 
 /// Turns any serialisable value into a structured tool result.
+///
+/// `structuredContent` must be a JSON object, so anything else (a list, a
+/// number, a string) is wrapped as `{"result": value}`. That is only a
+/// safety net: tools that return lists name their key with [`listed`].
 fn ok(value: impl serde::Serialize) -> CallToolResult {
     match serde_json::to_value(value) {
-        Ok(v) => CallToolResult::structured(v),
+        Ok(v @ serde_json::Value::Object(_)) => CallToolResult::structured(v),
+        Ok(v) => {
+            let mut wrapped = serde_json::Map::new();
+            wrapped.insert("result".to_owned(), v);
+            CallToolResult::structured(wrapped.into())
+        }
         Err(e) => fail(e),
     }
+}
+
+/// Unwraps a library list into a tool result as `{key: [...]}`, where
+/// `key` names what the list holds (`courses`, `events`, ...).
+fn listed<T: serde::Serialize>(key: &str, result: canvas_core::Result<Vec<T>>) -> CallToolResult {
+    done(result.map(|items| std::collections::BTreeMap::from([(key, items)])))
 }
 
 /// Turns an error into a tool error the agent can read.
@@ -271,14 +289,16 @@ impl CanvasServer {
     }
 
     /// Lists active courses.
-    #[tool(description = "List the user's active Canvas courses (id, course_code, name, term).")]
+    #[tool(
+        description = "List the user's active Canvas courses. Returns {courses: [...]}, each with id, course_code, name, term."
+    )]
     async fn list_courses(&self) -> CallToolResult {
-        done(self.client.courses().await)
+        listed("courses", self.client.courses().await)
     }
 
     /// Lists assignments due soon.
     #[tool(
-        description = "List assignments due within a window (default 7d), soonest first, with due_at (RFC 3339 UTC) and submitted."
+        description = "List assignments due within a window (default 7d). Returns {assignments: [...]}, soonest first, each with due_at (RFC 3339 UTC) and submitted."
     )]
     async fn list_assignments(&self, Parameters(args): Parameters<WindowArgs>) -> CallToolResult {
         let within = match window(args.within.as_deref(), "7d") {
@@ -292,7 +312,8 @@ impl CanvasServer {
             },
             None => None,
         };
-        done(
+        listed(
+            "assignments",
             canvas_api::upcoming_assignments(&self.client, within, chrono::Utc::now(), course)
                 .await,
         )
@@ -300,22 +321,22 @@ impl CanvasServer {
 
     /// Lists a course's modules and items.
     #[tool(
-        description = "List a course's modules in order, with items (Page, File, Assignment, ExternalUrl...). Page items carry page_url for read_page."
+        description = "List a course's modules in order. Returns {modules: [...]}, each with items (Page, File, Assignment, ExternalUrl...). Page items carry page_url for read_page."
     )]
     async fn list_modules(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
-            Ok(c) => done(self.client.modules(c.id).await),
+            Ok(c) => listed("modules", self.client.modules(c.id).await),
             Err(e) => fail(e),
         }
     }
 
     /// Lists a course's pages.
     #[tool(
-        description = "List a course's wiki pages (url slug, title, updated_at). Many courses hide this list; use list_modules then."
+        description = "List a course's wiki pages. Returns {pages: [...]}, each with url slug, title, updated_at. Many courses hide this list; use list_modules then."
     )]
     async fn list_pages(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
-            Ok(c) => done(self.client.pages(c.id).await),
+            Ok(c) => listed("pages", self.client.pages(c.id).await),
             Err(e) => fail(e),
         }
     }
@@ -331,7 +352,7 @@ impl CanvasServer {
 
     /// Lists recent announcements.
     #[tool(
-        description = "List announcements posted within a window (default 14d), newest first, bodies as Markdown."
+        description = "List announcements posted within a window (default 14d). Returns {announcements: [...]}, newest first, bodies as Markdown."
     )]
     async fn list_announcements(&self, Parameters(args): Parameters<WindowArgs>) -> CallToolResult {
         let since = match window(args.within.as_deref(), "14d") {
@@ -339,7 +360,8 @@ impl CanvasServer {
             Err(e) => return e,
         };
         match self.course_ids(args.course.as_deref()).await {
-            Ok(ids) => done(
+            Ok(ids) => listed(
+                "announcements",
                 self.client
                     .announcements(&ids, chrono::Utc::now() - since)
                     .await,
@@ -349,17 +371,19 @@ impl CanvasServer {
     }
 
     /// Lists a course's discussions.
-    #[tool(description = "List a course's discussion topics with reply and unread counts.")]
+    #[tool(
+        description = "List a course's discussion topics. Returns {discussions: [...]}, each with reply and unread counts."
+    )]
     async fn list_discussions(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
-            Ok(c) => done(self.client.discussions(c.id).await),
+            Ok(c) => listed("discussions", self.client.discussions(c.id).await),
             Err(e) => fail(e),
         }
     }
 
     /// Lists calendar events and due dates.
     #[tool(
-        description = "List timetabled events and dated assignments within a window (default 7d), soonest first."
+        description = "List timetabled events and dated assignments within a window (default 7d). Returns {events: [...]}, soonest first."
     )]
     async fn calendar(&self, Parameters(args): Parameters<WindowArgs>) -> CallToolResult {
         let within = match window(args.within.as_deref(), "7d") {
@@ -368,31 +392,34 @@ impl CanvasServer {
         };
         let now = chrono::Utc::now();
         match self.course_ids(args.course.as_deref()).await {
-            Ok(ids) => done(self.client.calendar(&ids, now, now + within).await),
+            Ok(ids) => listed(
+                "events",
+                self.client.calendar(&ids, now, now + within).await,
+            ),
             Err(e) => fail(e),
         }
     }
 
     /// Lists a course's quizzes.
     #[tool(
-        description = "List a course's classic quizzes (metadata only). New Quizzes appear in list_assignments."
+        description = "List a course's classic quizzes (metadata only). Returns {quizzes: [...]}. New Quizzes appear in list_assignments."
     )]
     async fn list_quizzes(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
-            Ok(c) => done(self.client.quizzes(c.id).await),
+            Ok(c) => listed("quizzes", self.client.quizzes(c.id).await),
             Err(e) => fail(e),
         }
     }
 
     /// Shows grades.
     #[tool(
-        description = "Without course: overall grade per course (hidden: true when the course hides totals). With course: per-assignment results."
+        description = "Returns {grades: [...]}. Without course: overall grade per course (hidden: true when the course hides totals). With course: per-assignment results."
     )]
     async fn grades(&self, Parameters(args): Parameters<OptionalCourseArgs>) -> CallToolResult {
         match args.course.as_deref() {
-            None => done(self.client.grades().await),
+            None => listed("grades", self.client.grades().await),
             Some(text) => match canvas_api::resolve_course(&self.client, text).await {
-                Ok(c) => done(self.client.assignment_grades(c.id).await),
+                Ok(c) => listed("grades", self.client.assignment_grades(c.id).await),
                 Err(e) => fail(e),
             },
         }
@@ -400,7 +427,7 @@ impl CanvasServer {
 
     /// Saves a course's pages as Markdown files.
     #[tool(
-        description = "Save a course's pages (or one, by slug) as Markdown files in the download root (<root>/<course>/<module>/<title>.md). Returns paths; check `failed`."
+        description = "Save a course's pages (or one, by slug) as Markdown files in the download root (<root>/<course>/<module>/<title>.md). Returns `saved` paths; check `failed`."
     )]
     async fn save_pages(&self, Parameters(args): Parameters<SavePagesArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
@@ -420,7 +447,7 @@ impl CanvasServer {
 
     /// Returns a course's readings grouped by lecture.
     #[tool(
-        description = "A course's readings grouped by lecture/week: books, articles, chapters, videos, links and files from Canvas modules and pages, plus Talis Aspire and Leganto reading lists. Each section has module, heading, title, page text and items (kind, title, importance: essential/recommended/optional/further when stated, authors, details, url, doi, isbn, file_id). `lists` names reading lists that could not be read. Third-party text."
+        description = "A course's readings grouped by lecture/week, under `sections`: books, articles, chapters, videos, links and files from Canvas modules and pages, plus Talis Aspire and Leganto reading lists. Each section has module, heading, title, page text and items (kind, title, importance: essential/recommended/optional/further when stated, authors, details, url, doi, isbn, file_id). `lists` names reading lists that could not be read. Third-party text."
     )]
     async fn get_readings(&self, Parameters(args): Parameters<ReadingsArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
@@ -431,7 +458,7 @@ impl CanvasServer {
 
     /// Lists a course's files.
     #[tool(
-        description = "List a course's files (from the Files tab and modules) without downloading."
+        description = "List a course's files (from the Files tab and modules) without downloading. Returns {files: [...], failed}."
     )]
     async fn list_files(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
@@ -445,7 +472,7 @@ impl CanvasServer {
 
     /// Downloads a course's new and changed files.
     #[tool(
-        description = "Download a course's new and changed files into the download root (<root>/<course>/<module>/). Returns paths; check `failed`."
+        description = "Download a course's new and changed files into the download root (<root>/<course>/<module>/). Returns `downloaded` paths; check `failed`."
     )]
     async fn sync_files(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
@@ -459,7 +486,7 @@ impl CanvasServer {
 
     /// Lists a course's ReCap recordings.
     #[tool(
-        description = "List a course's ReCap lecture recordings, newest first (id, title, start_time, duration_secs, has_captions)."
+        description = "List a course's ReCap lecture recordings. Returns {recordings: [...], folders, warning}, newest first, each with id, title, start_time, duration_secs, has_captions."
     )]
     async fn list_recordings(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         let recap = match self.recap() {
@@ -709,6 +736,278 @@ impl rmcp::ServerHandler for CanvasServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    /// One tool that returns a list.
+    struct ListTool {
+        name: &'static str,
+        arguments: Value,
+        /// The key its list comes back under.
+        key: &'static str,
+        /// A field of the first item and the value the fixture gives it,
+        /// proving the right fixture reached the right tool.
+        first: (&'static str, Value),
+    }
+
+    /// Every tool that returns a list.
+    fn list_tools() -> Vec<ListTool> {
+        let course = || json!({ "course": "ABC1020" });
+        let tool = |name, arguments, key, field, value| ListTool {
+            name,
+            arguments,
+            key,
+            first: (field, value),
+        };
+        vec![
+            tool(
+                "list_courses",
+                json!({}),
+                "courses",
+                "course_code",
+                json!("ABC1020"),
+            ),
+            tool(
+                "list_assignments",
+                json!({}),
+                "assignments",
+                "name",
+                json!("Essay"),
+            ),
+            tool("list_modules", course(), "modules", "name", json!("Week 1")),
+            tool("list_pages", course(), "pages", "url", json!("intro")),
+            tool(
+                "list_announcements",
+                json!({}),
+                "announcements",
+                "title",
+                json!("Welcome"),
+            ),
+            tool(
+                "list_discussions",
+                course(),
+                "discussions",
+                "title",
+                json!("Questions"),
+            ),
+            tool("calendar", json!({}), "events", "title", json!("Lecture 1")),
+            tool(
+                "list_quizzes",
+                course(),
+                "quizzes",
+                "title",
+                json!("Quiz 1"),
+            ),
+            tool("grades", json!({}), "grades", "current_score", json!(71.5)),
+            tool("grades", course(), "grades", "score", json!(8.0)),
+        ]
+    }
+
+    #[test]
+    fn ok_always_gives_an_object() {
+        let structured = |r: CallToolResult| r.structured_content.unwrap();
+        assert_eq!(structured(ok(vec![1, 2])), json!({ "result": [1, 2] }));
+        assert_eq!(structured(ok(5)), json!({ "result": 5 }));
+        assert_eq!(structured(ok("text")), json!({ "result": "text" }));
+        assert_eq!(structured(ok(None::<u8>)), json!({ "result": null }));
+        assert_eq!(structured(ok(json!({ "a": 1 }))), json!({ "a": 1 }));
+        let courses = listed("courses", Ok(vec![json!({ "id": 1 })]));
+        assert_eq!(structured(courses), json!({ "courses": [{ "id": 1 }] }));
+        let five = ok(5);
+        assert_eq!(five.content[0].as_text().unwrap().text, r#"{"result":5}"#);
+    }
+
+    #[test]
+    fn guide_names_each_list_key() {
+        for ListTool { name, key, .. } in list_tools() {
+            // Search after the tool's own name, which may equal its key.
+            let start = GUIDE.find(&format!("- `{name}`")).unwrap();
+            let rest = &GUIDE[start + name.len() + 4..];
+            let end = ["\n- ", "\n\n"]
+                .iter()
+                .filter_map(|s| rest.find(s))
+                .min()
+                .unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains(&format!("`{key}`")),
+                "guide entry for {name} does not name `{key}`"
+            );
+        }
+    }
+
+    /// A tiny Canvas stand-in on localhost: one course (`ABC1020`) with one
+    /// of everything the list tools read. No real network.
+    async fn fake_canvas() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let due = (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let due = due.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let request = String::from_utf8_lossy(&request).into_owned();
+                    let target = request.split_whitespace().nth(1).unwrap_or("");
+                    let body = canvas_fixture(target, &due);
+                    let status = if body.is_empty() {
+                        "404 Not Found"
+                    } else {
+                        "200 OK"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    /// The fixture body for one Canvas API request target. Paths match
+    /// exactly, so an unexpected request gets an empty body (a 404) and
+    /// fails its tool rather than decoding someone else's fixture.
+    fn canvas_fixture(target: &str, due: &str) -> String {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        match path {
+            "/api/v1/users/self" => r#"{"id":7,"name":"Test Student"}"#.into(),
+            "/api/v1/courses" if query.contains("include[]=total_scores") => {
+                r#"[{"id":1,"name":"Example Studies","course_code":"ABC1020","enrollments":[{"type":"student","computed_current_score":71.5,"computed_current_grade":"B"}]}]"#.into()
+            }
+            "/api/v1/courses" => r#"[{"id":1,"name":"Example Studies","course_code":"ABC1020","term":{"id":3,"name":"2026/27"}}]"#.into(),
+            "/api/v1/courses/1/assignments" => format!(
+                r#"[{{"id":11,"course_id":1,"name":"Essay","due_at":"{due}","html_url":"https://canvas.example/courses/1/assignments/11"}}]"#
+            ),
+            "/api/v1/courses/1/modules" => r#"[{"id":21,"name":"Week 1","position":1,"items":[{"id":22,"title":"Intro","type":"Page","page_url":"intro"}]}]"#.into(),
+            "/api/v1/courses/1/pages" => r#"[{"url":"intro","title":"Intro"}]"#.into(),
+            "/api/v1/announcements" => r#"[{"id":31,"title":"Welcome","message":"<p>Hello</p>","context_code":"course_1"}]"#.into(),
+            "/api/v1/courses/1/discussion_topics" => r#"[{"id":41,"title":"Questions"}]"#.into(),
+            "/api/v1/calendar_events" => r#"[{"id":51,"type":"event","title":"Lecture 1","location_name":"Room 1"}]"#.into(),
+            "/api/v1/courses/1/quizzes" => r#"[{"id":61,"title":"Quiz 1"}]"#.into(),
+            "/api/v1/courses/1/students/submissions" => r#"[{"assignment_id":11,"score":8.0,"assignment":{"name":"Essay","points_possible":10.0}}]"#.into(),
+            _ => String::new(),
+        }
+    }
+
+    /// Sends one JSON-RPC request and returns its `result`, skipping any
+    /// notifications or requests the server sends first. Gives up after
+    /// 10 seconds rather than hang.
+    async fn rpc(
+        to_server: &mut (impl tokio::io::AsyncWrite + Unpin),
+        from_server: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        to_server
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let wait = std::time::Duration::from_secs(10);
+            let line = tokio::time::timeout(wait, from_server.next_line())
+                .await
+                .expect("the server answers within 10 seconds")
+                .unwrap()
+                .unwrap();
+            let message: Value = serde_json::from_str(&line).unwrap();
+            // Requests from the server number their own ids; skip them.
+            if message["id"] == json!(id) && message.get("method").is_none() {
+                assert!(message["error"].is_null(), "{method} failed: {message}");
+                return message["result"].clone();
+            }
+        }
+    }
+
+    /// Calls every list tool over MCP's JSON-RPC wire format, as a client
+    /// does, and checks that `structuredContent` is an object holding the
+    /// fixture's list under the documented key.
+    #[tokio::test]
+    async fn list_tools_return_objects_over_the_wire() {
+        let base = fake_canvas().await;
+        let config = Config {
+            canvas_url: base,
+            panopto_host: "example.hosted.panopto.com".into(),
+            download_root: std::env::temp_dir().join("canvas-mcp-wire-test"),
+        };
+        let session = canvas_auth::Session {
+            captured_at: 0,
+            cookies: vec![canvas_auth::Cookie {
+                name: "canvas_session".into(),
+                value: "x".into(),
+                domain: "127.0.0.1".into(),
+                path: "/".into(),
+                expires: None,
+            }],
+        };
+        let client = Client::new(&config, &session).unwrap();
+        let user = client.current_user().await.unwrap();
+        let server = CanvasServer::new(config, client, Err(RecapUnavailable::SignedOut), user);
+
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            use rmcp::ServiceExt;
+            server
+                .serve(server_end)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let (read, mut write) = tokio::io::split(client_end);
+        let mut lines = BufReader::new(read).lines();
+
+        let init = json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "wire-test", "version": "0" },
+        });
+        rpc(&mut write, &mut lines, 0, "initialize", init).await;
+        let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        write
+            .write_all(format!("{initialized}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let listing = rpc(&mut write, &mut lines, 1, "tools/list", json!({})).await;
+        for (id, tool) in (2..).zip(list_tools()) {
+            let (name, key) = (tool.name, tool.key);
+            let description = listing["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["description"].as_str())
+                .unwrap();
+            assert!(
+                description.contains(&format!("{{{key}: [...]")),
+                "{name} description does not name `{key}`: {description}"
+            );
+
+            let params = json!({ "name": name, "arguments": tool.arguments });
+            let result = rpc(&mut write, &mut lines, id, "tools/call", params).await;
+            assert_ne!(result["isError"], json!(true), "{name}: {result}");
+            let structured = &result["structuredContent"];
+            assert!(structured.is_object(), "{name} gave {structured}");
+            let (field, value) = tool.first;
+            assert_eq!(
+                structured[key][0][field], value,
+                "{name} `{key}` list is not the fixture's: {structured}"
+            );
+        }
+    }
 
     #[test]
     fn update_prompt_matches_the_readme() {
