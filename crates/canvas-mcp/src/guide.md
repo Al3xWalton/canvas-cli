@@ -71,7 +71,19 @@ each list tool below names its key.
   hold the full reading list, so check `file` items too.
 - `list_announcements` (`within` defaults to `14d`, optional `course`):
   `announcements`, newest first.
-- `list_discussions` (`course`): `discussions`.
+- `list_discussions` (`course`): `discussions`, each with `id`, `title`,
+  the opening post and reply counts. `anonymous: true` ones cannot be read
+  in full: Canvas shows them only on its web page.
+- `read_discussion` (`discussion`: its link, from the course or a group,
+  its `id` or part of its title; `course` unless it is a link): the whole
+  discussion: the topic's `title`, `body`, `author` and `replies` and
+  `unread` counts, then `entries`, oldest first, each with `author`,
+  `posted_at`, `body` and its own `replies` nested inside. `unread: true`
+  marks replies the user has not read; `deleted: true` ones are kept only
+  for their replies. `note` says why replies are missing (the topic shows
+  them only after the user posts, or it is a group discussion and the user
+  is in none of its groups). If Canvas is still preparing a discussion,
+  call again in a minute.
 - `list_files` (`course`) and `sync_files` (`course`): list `files` (with
   `failed`), or download new and changed ones to `<root>/<course>/<module>/`
   (`downloaded`, with `failed`).
@@ -102,6 +114,10 @@ each list tool below names its key.
   `lecture` (e.g. `week 5`), summarise each item with its link, and read
   `text` for citations without links. Then use `get_transcript` for the
   matching recording if it has happened.
+- **Catch up on a discussion:** call `read_discussion` with the link (or
+  `course` and title), summarise the opening post, then the main points and
+  questions in `entries`, naming who said what. Mention `unread` replies
+  first if the user asks what is new.
 - **Daily notification:** call `digest` and report each `new_*` and
   `changed_assignments` item, then `upcoming`. Say "nothing new" when they
   are all empty.

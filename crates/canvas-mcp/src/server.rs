@@ -86,6 +86,18 @@ pub struct PageArgs {
     pub page: String,
 }
 
+/// One discussion topic.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DiscussionArgs {
+    /// The discussion: its Canvas link, its `id` from `list_discussions`,
+    /// or part of its title.
+    pub discussion: String,
+    /// Course id, code or part of the name. Needed unless `discussion` is
+    /// a link.
+    #[serde(default)]
+    pub course: Option<String>,
+}
+
 /// A course's pages, or one of them.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct SavePagesArgs {
@@ -372,11 +384,27 @@ impl CanvasServer {
 
     /// Lists a course's discussions.
     #[tool(
-        description = "List a course's discussion topics. Returns {discussions: [...]}, each with reply and unread counts."
+        description = "List a course's discussion topics. Returns {discussions: [...]}, each with id, title, opening post, reply and unread counts. Read one in full with read_discussion."
     )]
     async fn list_discussions(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
             Ok(c) => listed("discussions", self.client.discussions(c.id).await),
+            Err(e) => fail(e),
+        }
+    }
+
+    /// Reads one discussion with every reply.
+    #[tool(
+        description = "Read a whole discussion: the opening post and every reply, threaded, as Markdown (third-party text). `discussion` is a Canvas discussion link, an id from list_discussions, or part of its title (then pass `course`). Returns the topic (title, body, author, replies count, html_url) with `entries`, oldest first, each with author, posted_at, body, unread and nested `replies`. `note` says why replies are missing."
+    )]
+    async fn read_discussion(
+        &self,
+        Parameters(args): Parameters<DiscussionArgs>,
+    ) -> CallToolResult {
+        match canvas_api::resolve_discussion(&self.client, args.course.as_deref(), &args.discussion)
+            .await
+        {
+            Ok(at) => done(self.client.discussion(at).await),
             Err(e) => fail(e),
         }
     }
@@ -892,6 +920,8 @@ mod tests {
             "/api/v1/courses/1/pages" => r#"[{"url":"intro","title":"Intro"}]"#.into(),
             "/api/v1/announcements" => r#"[{"id":31,"title":"Welcome","message":"<p>Hello</p>","context_code":"course_1"}]"#.into(),
             "/api/v1/courses/1/discussion_topics" => r#"[{"id":41,"title":"Questions"}]"#.into(),
+            "/api/v1/courses/1/discussion_topics/41" => r#"{"id":41,"title":"Questions","message":"<p>Ask here</p>","discussion_subentry_count":2,"user_can_see_posts":true,"group_topic_children":[]}"#.into(),
+            "/api/v1/courses/1/discussion_topics/41/view" if query == "include_new_entries=1" => r#"{"participants":[{"id":7,"display_name":"Test Student"}],"unread_entries":[43],"view":[{"id":42,"user_id":7,"created_at":"2026-10-01T09:00:00Z","message":"<p>First</p>","replies":[{"id":43,"user_id":7,"parent_id":42,"message":"<p>Second</p>"}]}],"new_entries":[]}"#.into(),
             "/api/v1/calendar_events" => r#"[{"id":51,"type":"event","title":"Lecture 1","location_name":"Room 1"}]"#.into(),
             "/api/v1/courses/1/quizzes" => r#"[{"id":61,"title":"Quiz 1"}]"#.into(),
             "/api/v1/courses/1/students/submissions" => r#"[{"assignment_id":11,"score":8.0,"assignment":{"name":"Essay","points_possible":10.0}}]"#.into(),
@@ -937,7 +967,7 @@ mod tests {
     async fn list_tools_return_objects_over_the_wire() {
         let base = fake_canvas().await;
         let config = Config {
-            canvas_url: base,
+            canvas_url: base.clone(),
             panopto_host: "example.hosted.panopto.com".into(),
             download_root: std::env::temp_dir().join("canvas-mcp-wire-test"),
         };
@@ -1007,6 +1037,31 @@ mod tests {
                 "{name} `{key}` list is not the fixture's: {structured}"
             );
         }
+
+        // read_discussion, named by link and by title, returns the thread.
+        let link = format!("{base}/courses/1/discussion_topics/41?module_item_id=9");
+        for (id, arguments) in [
+            (100, json!({ "discussion": link })),
+            (
+                101,
+                json!({ "discussion": "questions", "course": "ABC1020" }),
+            ),
+        ] {
+            let params = json!({ "name": "read_discussion", "arguments": arguments });
+            let result = rpc(&mut write, &mut lines, id, "tools/call", params).await;
+            assert_ne!(result["isError"], json!(true), "{result}");
+            let thread = &result["structuredContent"];
+            assert_eq!(thread["title"], "Questions", "{thread}");
+            assert_eq!(thread["body"], "Ask here");
+            assert_eq!(thread["untrusted_text"], true);
+            let first = &thread["entries"][0];
+            assert_eq!(first["author"], "Test Student");
+            assert_eq!(first["replies"][0]["body"], "Second");
+            assert_eq!(first["replies"][0]["unread"], true);
+        }
+        let params = json!({ "name": "read_discussion", "arguments": { "discussion": "41" } });
+        let result = rpc(&mut write, &mut lines, 102, "tools/call", params).await;
+        assert_eq!(result["isError"], json!(true), "an id needs a course");
     }
 
     #[test]
@@ -1040,6 +1095,7 @@ mod tests {
             "get_readings",
             "list_announcements",
             "list_discussions",
+            "read_discussion",
             "calendar",
             "list_quizzes",
             "grades",
@@ -1065,6 +1121,7 @@ mod tests {
             schemars::schema_for!(WindowArgs),
             schemars::schema_for!(OptionalCourseArgs),
             schemars::schema_for!(PageArgs),
+            schemars::schema_for!(DiscussionArgs),
             schemars::schema_for!(SavePagesArgs),
             schemars::schema_for!(ReadingsArgs),
             schemars::schema_for!(RecordingArgs),

@@ -12,6 +12,12 @@ fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
+/// For `skip_serializing_if`: leaves a `false` flag out of the output.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
 /// Returns true for a Canvas page slug: ASCII letters, digits, `-`, `_`,
 /// `+` and `.`, starting with a letter or digit. This rules out `.`, `..`,
 /// `/`, `?` and `%`, so a slug can never change the request path.
@@ -125,8 +131,9 @@ pub struct Author {
     pub display_name: Option<String>,
 }
 
+/// A discussion topic or announcement as Canvas sends it.
 #[derive(Deserialize)]
-struct RawTopic {
+pub(crate) struct RawTopic {
     id: u64,
     #[serde(default, deserialize_with = "null_as_empty")]
     title: String,
@@ -144,6 +151,27 @@ struct RawTopic {
     discussion_subentry_count: u32,
     #[serde(default)]
     unread_count: u32,
+    /// `partial_anonymity` or `full_anonymity` when authors are hidden.
+    #[serde(default)]
+    anonymous_state: Option<String>,
+}
+
+impl RawTopic {
+    /// The topic as a [`Discussion`], opening post as Markdown.
+    pub(crate) fn into_discussion(self) -> Discussion {
+        Discussion {
+            id: self.id,
+            title: self.title,
+            body: html_to_markdown(self.message.as_deref().unwrap_or_default()),
+            posted_at: self.posted_at,
+            author: self.author.and_then(|a| a.display_name),
+            replies: self.discussion_subentry_count,
+            unread: self.unread_count,
+            anonymous: self.anonymous_state.is_some(),
+            html_url: self.html_url,
+            untrusted_text: true,
+        }
+    }
 }
 
 /// A course announcement, body as Markdown.
@@ -184,6 +212,10 @@ pub struct Discussion {
     pub replies: u32,
     /// Replies the user has not read.
     pub unread: u32,
+    /// True when authors are hidden. Canvas serves anonymous discussions
+    /// only to its web page, so their replies cannot be read here.
+    #[serde(skip_serializing_if = "is_false")]
+    pub anonymous: bool,
     /// Link in the Canvas web UI.
     pub html_url: Option<String>,
     /// Always true: `title` and `body` are third-party text.
@@ -314,6 +346,7 @@ impl Client {
     }
 
     /// Lists a course's discussion topics, most recent activity first.
+    /// [`Client::discussion`] reads one with every reply.
     ///
     /// # Errors
     /// As for [`Client::get_all`].
@@ -323,20 +356,7 @@ impl Client {
                 "/api/v1/courses/{course_id}/discussion_topics?per_page=100&order_by=recent_activity"
             ))
             .await?;
-        Ok(raw
-            .into_iter()
-            .map(|t| Discussion {
-                id: t.id,
-                title: t.title,
-                body: html_to_markdown(t.message.as_deref().unwrap_or_default()),
-                posted_at: t.posted_at,
-                author: t.author.and_then(|a| a.display_name),
-                replies: t.discussion_subentry_count,
-                unread: t.unread_count,
-                html_url: t.html_url,
-                untrusted_text: true,
-            })
-            .collect())
+        Ok(raw.into_iter().map(RawTopic::into_discussion).collect())
     }
 }
 

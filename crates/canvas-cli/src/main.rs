@@ -156,10 +156,14 @@ enum Command {
     /// List or download course files.
     #[command(subcommand)]
     Files(FilesCommand),
-    /// List a course's discussion topics.
+    /// List a course's discussion topics, or read one with every reply.
     Discussions {
-        /// Course id, code or part of the name.
+        /// Course id, code or part of the name; or a discussion's link to
+        /// read it.
         course: String,
+        /// Discussion to read: its id (from the list), part of its title,
+        /// or its link.
+        topic: Option<String>,
     },
 }
 
@@ -1190,16 +1194,34 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("{failed} file(s) or course(s) failed to sync");
             }
         }
-        Command::Discussions { course } => {
+        Command::Discussions { course, topic } => {
             let client = client(&config)?;
+            // A link alone names both the course and the discussion.
+            let link = course.contains("/discussion_topics/");
+            if link && topic.is_some() {
+                anyhow::bail!("give either a discussion link, or a course and a discussion");
+            }
+            let topic = topic.or_else(|| link.then(|| course.clone()));
+            if let Some(topic) = topic {
+                let at = canvas_api::resolve_discussion(&client, Some(&course), &topic).await?;
+                let thread = client.discussion(at).await?;
+                if cli.json {
+                    print_json(&thread);
+                } else {
+                    print_discussion(&thread);
+                }
+                return Ok(());
+            }
             let course = canvas_api::resolve_course(&client, &course).await?;
             let list = client.discussions(course.id).await?;
             if cli.json {
                 print_json(&list);
             } else {
                 for d in &list {
+                    let anonymous = if d.anonymous { "  (anonymous)" } else { "" };
                     out!(
-                        "{:>3} replies ({} unread)  {}",
+                        "{:<8} {:>3} replies ({} unread)  {}{anonymous}",
+                        d.id,
                         d.replies,
                         d.unread,
                         d.title
@@ -1391,6 +1413,65 @@ async fn recap_targets(
 fn client(config: &Config) -> anyhow::Result<canvas_api::Client> {
     let session = canvas_auth::load()?;
     Ok(canvas_api::Client::new(config, &session)?)
+}
+
+/// Prints a discussion as Markdown: the opening post, then each reply as a
+/// list item with its replies nested under it.
+fn print_discussion(d: &canvas_api::DiscussionThread) {
+    let t = &d.topic;
+    out!("# {}\n", t.title);
+    let by = [
+        t.author.clone(),
+        t.posted_at.map(local_time),
+        t.html_url.clone(),
+    ];
+    out!(
+        "{}\n",
+        by.into_iter().flatten().collect::<Vec<_>>().join(" · ")
+    );
+    if !t.body.is_empty() {
+        out!("{}\n", t.body);
+    }
+    out!("## Replies ({}, {} unread)\n", t.replies, t.unread);
+    if let Some(note) = &d.note {
+        out!("Note: {note}\n");
+    }
+    for e in &d.entries {
+        print_entry(e, 0);
+        out!("");
+    }
+}
+
+/// Prints one reply and, indented beneath it, the replies to it.
+fn print_entry(e: &canvas_api::DiscussionEntry, depth: usize) {
+    let pad = "  ".repeat(depth);
+    let who = match (&e.author, e.deleted) {
+        (_, true) => "(deleted)",
+        (Some(name), false) => name.as_str(),
+        (None, false) => "(unknown)",
+    };
+    let mut head = format!("{pad}- **{who}**");
+    if let Some(when) = e.posted_at {
+        head.push_str(&format!(" · {}", local_time(when)));
+    }
+    if let Some(likes) = e.likes {
+        let s = if likes == 1 { "" } else { "s" };
+        head.push_str(&format!(" · {likes} like{s}"));
+    }
+    if e.unread {
+        head.push_str(" · unread");
+    }
+    out!("{head}");
+    for line in e.body.lines() {
+        if line.is_empty() {
+            out!("");
+        } else {
+            out!("{pad}  {line}");
+        }
+    }
+    for reply in &e.replies {
+        print_entry(reply, depth + 1);
+    }
 }
 
 /// Prints readings as Markdown, one heading per section.
