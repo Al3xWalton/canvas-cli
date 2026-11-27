@@ -143,7 +143,9 @@ pub async fn save_pages(
             .get(&key(&rel.join(&name)))
             .is_some_and(|s| *s != w.slug)
         {
-            name = format!("{} ({}).md", sanitize(title), w.slug);
+            // Slugs may hold `|` and other characters `sanitize` keeps off
+            // disk, so the slug is sanitised too.
+            name = format!("{} ({}).md", sanitize(title), sanitize(&w.slug));
         }
         rel.push(&name);
         taken.insert(key(&rel), w.slug.clone());

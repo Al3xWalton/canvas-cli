@@ -19,15 +19,16 @@ pub(crate) fn is_false(flag: &bool) -> bool {
 }
 
 /// Returns true for a Canvas page slug: ASCII letters, digits, `-`, `_`,
-/// `+` and `.`, starting with a letter or digit. This rules out `.`, `..`,
-/// `/`, `?` and `%`, so a slug can never change the request path.
+/// `+`, `|` and `.`, starting with a letter or digit. Canvas keeps `|` from
+/// titles such as `Skills | Week 1`. This rules out `.`, `..`, `/`, `?`,
+/// `#` and `%`, so a slug can never change the request path.
 fn valid_slug(slug: &str) -> bool {
     slug.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric())
         && slug
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '|'))
 }
 
 /// Courses per announcements request, keeping the URL short.
@@ -369,7 +370,10 @@ mod tests {
         assert!(valid_slug("module-information-2"));
         assert!(valid_slug("week_1.notes"));
         assert!(valid_slug("lgbtqa+-support"));
-        for bad in ["", ".", "..", "../x", "a/b", "a?b=1", "%2e%2e", "a b", "-x"] {
+        assert!(valid_slug("skills-|-week-1"));
+        for bad in [
+            "", ".", "..", "../x", "a/b", "a?b=1", "%2e%2e", "a b", "-x", "a#b", "|x",
+        ] {
             assert!(!valid_slug(bad), "{bad}");
         }
     }
