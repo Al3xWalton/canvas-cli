@@ -1,16 +1,38 @@
-//! Course files and folders.
+//! Course files and folders, and links to files.
 //!
 //! Many universities refuse the Files list to students
-//! with a 403 while still linking files from modules. Callers should
-//! treat [`Client::files`] as optional and fall back to module `File`
-//! items, fetching each with [`Client::file`].
+//! with a 403 while still linking files from modules and from inside
+//! pages. Callers should treat [`Client::files`] as optional and fall back
+//! to module `File` items and page links, fetching each with
+//! [`Client::file`].
+//!
+//! A file link is `/courses/<course>/files/<file>` on the Canvas site, with
+//! any tail (`?wrap=1`, `/preview`, `/download?download_frd=1`), the
+//! `/api/v1` form, or the Files tab's `/courses/<course>/files?preview=<file>`.
+//! It may be absolute or relative to the site. Only the ids are read from a
+//! link; nothing is ever fetched from it.
+
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use canvas_core::Result;
+use canvas_core::{Error, Result};
 
 use crate::Client;
+
+/// The `href` of each `<a>` tag, quoted either way or bare. Only anchors
+/// count: images (`<img src>`) and embeds show in the page, they are not
+/// files it links to. Earlier attributes are skipped whole, so a `>` or an
+/// ` href=` inside a quoted value (`title="Week 1 > Slides"`) is not
+/// mistaken for the end of the tag or the link.
+static ANCHOR_HREF: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)<a\b(?:[^>"']|"[^"]*"|'[^']*')*?\shref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))"#,
+    )
+    .ok()
+});
 
 /// A file's metadata. `url` is a short-lived download link.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +60,9 @@ pub struct CanvasFile {
     /// True if the file exists but is locked for this user.
     #[serde(default)]
     pub locked_for_user: bool,
+    /// Why it is locked, e.g. until a date. Canvas text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_explanation: Option<String>,
 }
 
 /// A course folder, used to place files on disk.
@@ -77,5 +102,238 @@ impl Client {
     pub async fn folders(&self, course_id: u64) -> Result<Vec<Folder>> {
         self.get_all(&format!("/api/v1/courses/{course_id}/folders?per_page=100"))
             .await
+    }
+
+    /// Reads `(course id, file id)` from a file link on this Canvas site,
+    /// e.g. `https://canvas.example.edu/courses/1/files/42?wrap=1`,
+    /// `/courses/1/files/42/download` or `canvas.example.edu/courses/1/files/42`,
+    /// optionally in `<>` or quotes as pasted. `None` for anything else,
+    /// including a file link on another site.
+    pub fn file_link(&self, text: &str) -> Option<(u64, u64)> {
+        let text = text.trim().trim_matches(['<', '>', '"', '\'']).trim();
+        file_ids(&self.site_url(text)?)
+    }
+
+    /// The file id in `text`, which is a file id (`12345678`) or a file
+    /// link in course `course_id`.
+    ///
+    /// # Errors
+    /// [`Error::Input`] if `text` is neither, or links a file in another
+    /// course.
+    pub fn resolve_file(&self, course_id: u64, text: &str) -> Result<u64> {
+        let text = text.trim();
+        if let Ok(id) = text.parse::<u64>() {
+            return Ok(id);
+        }
+        match self.file_link(text) {
+            Some((course, file)) if course == course_id => Ok(file),
+            Some((course, _)) => Err(Error::Input(format!(
+                "`{text}` is a file in course {course}, not course {course_id}"
+            ))),
+            None => Err(Error::Input(format!(
+                "`{text}` is not a file id or a file link on your Canvas site \
+                 (…/courses/<id>/files/<id>)"
+            ))),
+        }
+    }
+
+    /// The files of course `course_id` that an HTML page body links to
+    /// with `<a href>`, in order, each once. Images and embeds are not
+    /// links, and links to other courses or other sites are left out.
+    pub fn linked_files(&self, course_id: u64, html: &str) -> Vec<u64> {
+        let Some(re) = ANCHOR_HREF.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<u64> = Vec::new();
+        for caps in re.captures_iter(html) {
+            let href = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .or_else(|| caps.get(3))
+                .map_or("", |m| m.as_str())
+                .replace("&amp;", "&")
+                .replace("&#38;", "&")
+                .replace("&#x26;", "&");
+            if let Some((course, file)) = self.file_link(&href)
+                && course == course_id
+                && !out.contains(&file)
+            {
+                out.push(file);
+            }
+        }
+        out
+    }
+
+    /// `text` as a URL on this Canvas site: absolute, relative to the site
+    /// (`/courses/...`), or the site's host without a scheme. `None` if it
+    /// is none of these, or is on another host or port.
+    fn site_url(&self, text: &str) -> Option<url::Url> {
+        let lower = text.to_ascii_lowercase();
+        let host = self.base.host_str()?.to_ascii_lowercase();
+        let url = if lower.starts_with("https://") || lower.starts_with("http://") {
+            url::Url::parse(text).ok()?
+        } else if text.starts_with('/') && !text.starts_with("//") {
+            self.base.join(text).ok()?
+        } else if lower.starts_with(&host) {
+            url::Url::parse(&format!("{}://{text}", self.base.scheme())).ok()?
+        } else {
+            return None;
+        };
+        // `port()` is `None` for a scheme's default port, so `https://host`,
+        // `https://host:443` and `http://host` all match a default-port site.
+        let same_site = url.host_str() == self.base.host_str() && url.port() == self.base.port();
+        same_site.then_some(url)
+    }
+}
+
+/// The course and file ids in a file link's path (and, for the Files
+/// tab's preview, its query).
+fn file_ids(url: &url::Url) -> Option<(u64, u64)> {
+    let parts: Vec<&str> = url.path_segments()?.filter(|p| !p.is_empty()).collect();
+    let parts = match parts.as_slice() {
+        ["api", "v1", rest @ ..] => rest,
+        all => all,
+    };
+    match parts {
+        ["courses", course, "files", file, ..] if is_id(file) => {
+            Some((course.parse().ok()?, file.parse().ok()?))
+        }
+        // The Files tab previewing a file: `files?preview=42`, also inside
+        // a folder (`files/folder/Week 1?preview=42`).
+        ["courses", course, "files", ..] => {
+            let preview = url
+                .query_pairs()
+                .find(|(k, _)| k == "preview")
+                .map(|(_, v)| v.into_owned())?;
+            if !is_id(&preview) {
+                return None;
+            }
+            Some((course.parse().ok()?, preview.parse().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// True for a non-empty run of ASCII digits: `2abc` is not file 2.
+fn is_id(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::tests::{client, serve};
+
+    async fn site() -> Client {
+        let (base, _) = serve(vec![]).await;
+        client(&base)
+    }
+
+    fn base_of(c: &Client) -> String {
+        c.base.as_str().trim_end_matches('/').to_owned()
+    }
+
+    #[tokio::test]
+    async fn every_link_shape_gives_course_and_file() {
+        let c = site().await;
+        let base = base_of(&c);
+        let host = base.trim_start_matches("http://").to_owned();
+        for link in [
+            "/courses/70/files/42".to_owned(),
+            "/courses/70/files/42?wrap=1".to_owned(),
+            "/courses/70/files/42/download?download_frd=1".to_owned(),
+            "/courses/70/files/42/preview".to_owned(),
+            "/courses/70/files?preview=42".to_owned(),
+            "/courses/70/files/folder/Week%201?preview=42".to_owned(),
+            format!("{base}/courses/70/files/42?wrap=1"),
+            format!("{base}/api/v1/courses/70/files/42"),
+            format!("  <{}/courses/70/files/42>  ", base.to_uppercase()),
+            format!("\"{base}/courses/70/files/42\""),
+            format!("{host}/courses/70/files/42"),
+        ] {
+            assert_eq!(c.file_link(&link), Some((70, 42)), "{link}");
+        }
+        for not_a_file in [
+            "https://other.example/courses/70/files/42".to_owned(),
+            format!("{base}0/courses/70/files/42"),
+            "//other.example/courses/70/files/42".to_owned(),
+            "/courses/70/pages/intro".to_owned(),
+            "/courses/70/files/2abc".to_owned(),
+            "/courses/70/files?preview=x".to_owned(),
+            "/users/5/files/42".to_owned(),
+            "/files/42".to_owned(),
+            "see /courses/70/files/42".to_owned(),
+            "42".to_owned(),
+        ] {
+            assert_eq!(c.file_link(&not_a_file), None, "{not_a_file}");
+        }
+    }
+
+    #[test]
+    fn the_default_port_is_the_same_site() {
+        let config = canvas_core::Config {
+            canvas_url: "https://canvas.example.edu".into(),
+            ..canvas_core::Config::default()
+        };
+        let session = canvas_auth::Session {
+            captured_at: 0,
+            cookies: vec![canvas_auth::Cookie {
+                name: "canvas_session".into(),
+                value: "x".into(),
+                domain: "canvas.example.edu".into(),
+                path: "/".into(),
+                expires: None,
+            }],
+        };
+        let c = Client::new(&config, &session).unwrap();
+        let link = "https://canvas.example.edu:443/courses/70/files/42";
+        assert_eq!(c.file_link(link), Some((70, 42)));
+        let plain = "http://canvas.example.edu/courses/70/files/42";
+        assert_eq!(c.file_link(plain), Some((70, 42)));
+        assert_eq!(
+            c.file_link("https://canvas.example.edu:8443/courses/70/files/42"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn file_arguments_are_ids_or_links_in_the_course() {
+        let c = site().await;
+        let base = base_of(&c);
+        assert_eq!(c.resolve_file(70, " 12345678 ").unwrap(), 12_345_678);
+        let link = format!("{base}/courses/70/files/42?wrap=1");
+        assert_eq!(c.resolve_file(70, &link).unwrap(), 42);
+        let err = c.resolve_file(71, &link).unwrap_err().to_string();
+        assert!(err.contains("course 70, not course 71"), "{err}");
+        assert!(c.resolve_file(70, "slides.pdf").is_err());
+        assert!(
+            c.resolve_file(70, "https://other.example/courses/70/files/42")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_link_this_courses_files_once_by_anchor_only() {
+        let c = site().await;
+        let base = base_of(&c);
+        let html = format!(
+            r#"<p>Slides: <a href="{base}/courses/70/files/42?wrap=1" title="Week 1.pdf" data-api-endpoint="{base}/api/v1/courses/70/files/42">Week 1.pdf</a></p>
+            <p>Again: <a class="x" href='/courses/70/files/42/download'>same</a></p>
+            <p><img src="{base}/courses/70/files/43/preview" alt="Figure [1] chart"></p>
+            <p><a href="{base}/courses/70/files/45?wrap=1&amp;verifier=v"><img src="{base}/courses/70/files/44/preview"></a></p>
+            <p>Read this!<a href="{base}/courses/70/files/46">handout</a></p>
+            <p>Other course: <a href="{base}/courses/71/files/47?wrap=1">x</a></p>
+            <p>Other site: <a href="https://other.example/courses/70/files/48">y</a></p>
+            <p>Inside another link: <a href="https://other.example/a/courses/70/files/49">z</a></p>
+            <p><A HREF=/courses/70/files/50/download>bare</A></p>
+            <p>Files tab: <a href="/courses/70/files?preview=51">preview</a></p>
+            <p><a title="Week 1 > Slides" href="/courses/70/files/52">angle in a title</a></p>
+            <p><a title=" href=/courses/70/files/53" href="/courses/70/files/54">href in a title</a></p>
+            <p><a href="/courses/70/files?x=1&#38;preview=55">encoded</a></p>"#
+        );
+        assert_eq!(
+            c.linked_files(70, &html),
+            vec![42, 45, 46, 50, 51, 52, 54, 55]
+        );
     }
 }

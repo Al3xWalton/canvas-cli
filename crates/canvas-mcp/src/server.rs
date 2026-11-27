@@ -86,6 +86,27 @@ pub struct PageArgs {
     pub page: String,
 }
 
+/// A course's files to sync.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct SyncArgs {
+    /// Course id, code or part of the name.
+    pub course: String,
+    /// Also download files linked from inside module pages (reads every
+    /// page, so slower). Default false.
+    #[serde(default)]
+    pub linked: bool,
+}
+
+/// One course file to download.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct GetFileArgs {
+    /// Course id, code or part of the name.
+    pub course: String,
+    /// The file: its id (`12345678`, from `list_files`) or a Canvas file
+    /// link (`…/courses/<id>/files/<id>`, with any `?wrap=1` or `/download`).
+    pub file: String,
+}
+
 /// One discussion topic.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DiscussionArgs {
@@ -486,27 +507,47 @@ impl CanvasServer {
 
     /// Lists a course's files.
     #[tool(
-        description = "List a course's files (from the Files tab and modules) without downloading. Returns {files: [...], failed}."
+        description = "List a course's files without downloading: from the Files tab, module items, and links inside module pages (reads every page). Returns {files: [...], failed, unavailable, warnings}; each file has id, display_name, size, source (files, module or page) and, for page links, the page slug."
     )]
     async fn list_files(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
-            Ok(c) => match canvas_sync::list_files(&self.client, &c).await {
-                Ok((files, failed)) => ok(serde_json::json!({ "files": files, "failed": failed })),
-                Err(e) => fail(e),
-            },
+            Ok(c) => done(canvas_sync::list_files(&self.client, &c).await),
             Err(e) => fail(e),
         }
     }
 
     /// Downloads a course's new and changed files.
     #[tool(
-        description = "Download a course's new and changed files into the download root (<root>/<course>/<module>/). Returns `downloaded` paths; check `failed`."
+        description = "Download a course's new and changed files into the download root (<root>/<course>/<module>/). `linked: true` also downloads files linked from inside module pages. Returns `downloaded` paths; check `failed` (`unavailable` lists page links Canvas no longer serves, not errors)."
     )]
-    async fn sync_files(&self, Parameters(args): Parameters<CourseArgs>) -> CallToolResult {
+    async fn sync_files(&self, Parameters(args): Parameters<SyncArgs>) -> CallToolResult {
         match canvas_api::resolve_course(&self.client, &args.course).await {
             Ok(c) => done(
-                canvas_sync::sync_course(&self.client, &c, &self.config.download_root, |_| {})
-                    .await,
+                canvas_sync::sync_course(
+                    &self.client,
+                    &c,
+                    &self.config.download_root,
+                    args.linked,
+                    |_| {},
+                )
+                .await,
+            ),
+            Err(e) => fail(e),
+        }
+    }
+
+    /// Downloads one file.
+    #[tool(
+        description = "Download one course file, by id or Canvas file link (e.g. one linked from inside a page), into the download root where a sync would put it. Returns {path, id, name, size, updated_at, downloaded, warnings}. Waits up to 45s if a sync of the same course is running."
+    )]
+    async fn get_file(&self, Parameters(args): Parameters<GetFileArgs>) -> CallToolResult {
+        let course = match canvas_api::resolve_course(&self.client, &args.course).await {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        match self.client.resolve_file(course.id, &args.file) {
+            Ok(id) => done(
+                canvas_sync::get_file(&self.client, &course, &self.config.download_root, id).await,
             ),
             Err(e) => fail(e),
         }
@@ -869,10 +910,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let due = (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+        let me = base.clone();
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let due = due.clone();
+                let me = me.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -885,7 +928,7 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&request).into_owned();
                     let target = request.split_whitespace().nth(1).unwrap_or("");
-                    let body = canvas_fixture(target, &due);
+                    let body = canvas_fixture(target, &due, &me);
                     let status = if body.is_empty() {
                         "404 Not Found"
                     } else {
@@ -905,7 +948,7 @@ mod tests {
     /// The fixture body for one Canvas API request target. Paths match
     /// exactly, so an unexpected request gets an empty body (a 404) and
     /// fails its tool rather than decoding someone else's fixture.
-    fn canvas_fixture(target: &str, due: &str) -> String {
+    fn canvas_fixture(target: &str, due: &str, base: &str) -> String {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         match path {
             "/api/v1/users/self" => r#"{"id":7,"name":"Test Student"}"#.into(),
@@ -918,6 +961,16 @@ mod tests {
             ),
             "/api/v1/courses/1/modules" => r#"[{"id":21,"name":"Week 1","position":1,"items":[{"id":22,"title":"Intro","type":"Page","page_url":"intro"}]}]"#.into(),
             "/api/v1/courses/1/pages" => r#"[{"url":"intro","title":"Intro"}]"#.into(),
+            // The Intro page links file 71, which no module item or Files
+            // list shows.
+            "/api/v1/courses/1/pages/intro" => format!(
+                r#"{{"url":"intro","title":"Intro","body":"<p><a href=\"{base}/courses/1/files/71?wrap=1\">Workshop 1</a></p>"}}"#
+            ),
+            "/api/v1/courses/1/files/71" => format!(
+                r#"{{"id":71,"display_name":"Workshop 1.pdf","size":5,"updated_at":"2026-10-01T09:00:00Z","folder_id":3,"url":"{base}/files/71/download?verifier=x"}}"#
+            ),
+            "/api/v1/courses/1/folders" => r#"[{"id":3,"full_name":"course files"}]"#.into(),
+            "/files/71/download" => "hello".into(),
             "/api/v1/announcements" => r#"[{"id":31,"title":"Welcome","message":"<p>Hello</p>","context_code":"course_1"}]"#.into(),
             "/api/v1/courses/1/discussion_topics" => r#"[{"id":41,"title":"Questions"}]"#.into(),
             "/api/v1/courses/1/discussion_topics/41" => r#"{"id":41,"title":"Questions","message":"<p>Ask here</p>","discussion_subentry_count":2,"user_can_see_posts":true,"group_topic_children":[]}"#.into(),
@@ -969,8 +1022,10 @@ mod tests {
         let config = Config {
             canvas_url: base.clone(),
             panopto_host: "example.hosted.panopto.com".into(),
-            download_root: std::env::temp_dir().join("canvas-mcp-wire-test"),
+            download_root: std::env::temp_dir()
+                .join(format!("canvas-mcp-wire-test-{}", std::process::id())),
         };
+        let download_root = config.download_root.clone();
         let session = canvas_auth::Session {
             captured_at: 0,
             cookies: vec![canvas_auth::Cookie {
@@ -1062,6 +1117,30 @@ mod tests {
         let params = json!({ "name": "read_discussion", "arguments": { "discussion": "41" } });
         let result = rpc(&mut write, &mut lines, 102, "tools/call", params).await;
         assert_eq!(result["isError"], json!(true), "an id needs a course");
+
+        // list_files finds the file linked only from inside the Intro page.
+        let params = json!({ "name": "list_files", "arguments": { "course": "ABC1020" } });
+        let result = rpc(&mut write, &mut lines, 103, "tools/call", params).await;
+        let listed = &result["structuredContent"];
+        assert_eq!(listed["files"][0]["id"], 71, "{listed}");
+        assert_eq!(listed["files"][0]["source"], "page");
+        assert_eq!(listed["files"][0]["page"], "intro");
+
+        // get_file saves it under the page's module and returns the path.
+        let link = format!("{base}/courses/1/files/71?wrap=1");
+        let params =
+            json!({ "name": "get_file", "arguments": { "course": "ABC1020", "file": link } });
+        let result = rpc(&mut write, &mut lines, 104, "tools/call", params).await;
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let saved = &result["structuredContent"];
+        let path = std::path::PathBuf::from(saved["path"].as_str().unwrap());
+        assert!(path.ends_with("ABC1020/Week 1/Workshop 1.pdf"), "{saved}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_eq!(
+            (saved["id"].clone(), saved["size"].clone()),
+            (json!(71), json!(5))
+        );
+        std::fs::remove_dir_all(&download_root).unwrap();
     }
 
     #[test]
@@ -1101,6 +1180,7 @@ mod tests {
             "grades",
             "list_files",
             "sync_files",
+            "get_file",
             "list_recordings",
             "recording_info",
             "get_transcript",
@@ -1122,6 +1202,8 @@ mod tests {
             schemars::schema_for!(OptionalCourseArgs),
             schemars::schema_for!(PageArgs),
             schemars::schema_for!(DiscussionArgs),
+            schemars::schema_for!(SyncArgs),
+            schemars::schema_for!(GetFileArgs),
             schemars::schema_for!(SavePagesArgs),
             schemars::schema_for!(ReadingsArgs),
             schemars::schema_for!(RecordingArgs),
