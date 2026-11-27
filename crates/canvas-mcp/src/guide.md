@@ -84,9 +84,24 @@ each list tool below names its key.
   them only after the user posts, or it is a group discussion and the user
   is in none of its groups). If Canvas is still preparing a discussion,
   call again in a minute.
-- `list_files` (`course`) and `sync_files` (`course`): list `files` (with
-  `failed`), or download new and changed ones to `<root>/<course>/<module>/`
-  (`downloaded`, with `failed`).
+- `list_files` (`course`): `files`, from the Files tab, module items and
+  links inside module pages, each with `id`, `display_name`, `size` and a
+  `source` (`files`, `module` or `page`; page links also name the `page`
+  slug). Also `failed`; `unavailable` for page links to files Canvas
+  hides or refuses (stale or unpublished links, not errors); and `warnings`
+  for pages that could not be read. It reads every module page, so it takes
+  a few seconds.
+- `sync_files` (`course`, `linked` defaults to false): download new and
+  changed files to `<root>/<course>/<module>/` (`downloaded`, with
+  `failed`, and `unavailable` for page links Canvas no longer serves).
+  `linked: true` also downloads files linked from inside module pages.
+  Many courses hide the Files tab and link slides only from pages.
+- `get_file` (`course`, `file`: an `id` from `list_files` or a Canvas file
+  link): download one file to where a sync would put it, and return its
+  `path`, with `id`, `name`, `size`, `updated_at` and `downloaded` (false
+  if the local copy was already up to date) and any `warnings`. A later
+  sync treats it as known. A locked or refused file is an error saying so.
+  It waits up to 45 seconds if a sync of the same course is running.
 
 ## Lectures (ReCap)
 - `list_recordings` (`course`): `recordings`, newest first, with `id`,
@@ -118,6 +133,9 @@ each list tool below names its key.
   `course` and title), summarise the opening post, then the main points and
   questions in `entries`, naming who said what. Mention `unread` replies
   first if the user asks what is new.
+- **Get a page's slides:** call `read_page` (or `list_files` for the
+  course, whose page links say which page), then `get_file` with each
+  file link or `id`, and open the returned `path`.
 - **Daily notification:** call `digest` and report each `new_*` and
   `changed_assignments` item, then `upcoming`. Say "nothing new" when they
   are all empty.

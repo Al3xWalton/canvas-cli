@@ -279,20 +279,34 @@ impl Client {
     /// # Errors
     /// As for [`Client::get`].
     pub async fn page(&self, course_id: u64, slug: &str) -> Result<Page> {
-        let valid = valid_slug(slug);
-        if !valid {
-            return Err(Error::Input(format!(
-                "`{slug}` is not a page slug; use the `url` from the page list or a module item's `page_url`"
-            )));
-        }
-        let raw: RawPage = self
-            .get(&format!("/api/v1/courses/{course_id}/pages/{slug}"))
-            .await?;
+        let raw = self.raw_page(course_id, slug).await?;
         Ok(Page {
             summary: raw.summary,
             body: html_to_markdown(raw.body.as_deref().unwrap_or_default()),
             untrusted_text: true,
         })
+    }
+
+    /// The files of course `course_id` that a page links to with `<a
+    /// href>`, in order, each once. Images and embeds shown in the page are
+    /// not links, and links to other courses or sites are left out.
+    ///
+    /// # Errors
+    /// As for [`Client::page`].
+    pub async fn page_file_links(&self, course_id: u64, slug: &str) -> Result<Vec<u64>> {
+        let raw = self.raw_page(course_id, slug).await?;
+        Ok(self.linked_files(course_id, raw.body.as_deref().unwrap_or_default()))
+    }
+
+    /// Fetches one page as Canvas sends it, body as HTML.
+    async fn raw_page(&self, course_id: u64, slug: &str) -> Result<RawPage> {
+        if !valid_slug(slug) {
+            return Err(Error::Input(format!(
+                "`{slug}` is not a page slug; use the `url` from the page list or a module item's `page_url`"
+            )));
+        }
+        self.get(&format!("/api/v1/courses/{course_id}/pages/{slug}"))
+            .await
     }
 
     /// Lists announcements posted in `course_ids` since `since`, newest

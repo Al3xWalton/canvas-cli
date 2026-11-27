@@ -104,7 +104,10 @@ command for machine-readable output.
 - `announcements --since 14d`, `modules <course>`, `pages <course> [page] [--save]`, `discussions <course>`, `quizzes <course>`: course content as Markdown.
 - `discussions <course> <topic>`, or `discussions <link>`: read a whole discussion, with every reply threaded under the post it answers. Name the topic by its id from the list, part of its title, or its Canvas link.
 - `digest`: what's new since the last run (announcements, assignments, files, recordings), plus what's due soon.
-- `files sync <course|--all>`: download new and changed course files to `~/Canvas`.
+- `files list <course>`: a course's files from the Files tab, modules and links inside module pages.
+- `files sync <course|--all> [--linked]`: download new and changed course files to `~/Canvas`. `--linked` also downloads files linked from inside module pages, which is where many courses keep their slides.
+- `files get <course> <file>...`: download particular files, by id or Canvas file link (e.g. `…/courses/<id>/files/<id>?wrap=1`), to where a sync would put them. Prints each saved path. Page links Canvas no longer serves are reported, not counted as failures.
+- `files sync` and `files get` take `--root <dir>` to write somewhere other than the configured folder.
 - `recap list <course>`, `recap info <recording>`: a course's lecture recordings, with chapters.
 - `recap download <recording|course> --latest N`: save lectures as MP4. Interrupted downloads resume.
 - `recap transcript <recording|course> [--language all]`: save `.srt` and readable `.txt` transcripts.

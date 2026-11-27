@@ -260,7 +260,8 @@ enum RecapCommand {
 /// `canvas files ...`
 #[derive(Debug, Subcommand)]
 enum FilesCommand {
-    /// List a course's files (from the Files tab and from modules).
+    /// List a course's files: from the Files tab, from modules, and linked
+    /// from inside module pages.
     List {
         /// Course id, code or part of the name.
         course: String,
@@ -272,6 +273,23 @@ enum FilesCommand {
         /// Sync every active course.
         #[arg(long, conflicts_with = "course")]
         all: bool,
+        /// Also download files linked from inside module pages (reads
+        /// every page, so slower).
+        #[arg(long)]
+        linked: bool,
+        /// Download here instead of the configured download_root.
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// Download particular files, e.g. ones linked from inside a page, to
+    /// where a sync would put them. With --json, prints one JSON object
+    /// per file.
+    Get {
+        /// Course id, code or part of the name.
+        course: String,
+        /// File ids (12345678) or Canvas file links (`…/courses/<id>/files/<id>`).
+        #[arg(required = true)]
+        files: Vec<String>,
         /// Download here instead of the configured download_root.
         #[arg(long)]
         root: Option<std::path::PathBuf>,
@@ -1118,23 +1136,45 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Files(FilesCommand::List { course }) => {
             let client = client(&config)?;
             let course = canvas_api::resolve_course(&client, &course).await?;
-            let (files, failed) = canvas_sync::list_files(&client, &course).await?;
+            let list = canvas_sync::list_files(&client, &course).await?;
             if cli.json {
-                print_json(&serde_json::json!({ "files": files, "failed": failed }));
+                print_json(&list);
             } else {
-                for f in &files {
+                for l in &list.files {
+                    let f = &l.file;
                     let lock = if f.locked_for_user { " (locked)" } else { "" };
-                    out!("{:>10}  {}{lock}", human_bytes(f.size), f.display_name);
+                    let page = l
+                        .page
+                        .as_deref()
+                        .map(|p| format!("  [linked from page {p}]"))
+                        .unwrap_or_default();
+                    out!(
+                        "{:>10}  {:<10} {}{lock}{page}",
+                        human_bytes(f.size),
+                        f.id,
+                        f.display_name
+                    );
                 }
-                for f in &failed {
+                for f in &list.failed {
                     out!("    failed  {} ({})", f.name, f.reason);
                 }
+                for f in &list.unavailable {
+                    out!(" not shown  {} ({})", f.name, f.reason);
+                }
+                for w in &list.warnings {
+                    out!("   warning  {w}");
+                }
             }
-            if !failed.is_empty() {
-                anyhow::bail!("{} file(s) could not be read", failed.len());
+            if !list.failed.is_empty() {
+                anyhow::bail!("{} file(s) could not be read", list.failed.len());
             }
         }
-        Command::Files(FilesCommand::Sync { course, all, root }) => {
+        Command::Files(FilesCommand::Sync {
+            course,
+            all,
+            linked,
+            root,
+        }) => {
             let client = client(&config)?;
             let courses = match (course, all) {
                 (Some(text), _) => vec![canvas_api::resolve_course(&client, &text).await?],
@@ -1146,7 +1186,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let mut course_errors: Vec<(u64, String)> = Vec::new();
             for course in &courses {
                 let quiet = cli.json;
-                let result = canvas_sync::sync_course(&client, course, &root, |path| {
+                let result = canvas_sync::sync_course(&client, course, &root, linked, |path| {
                     if !quiet {
                         eprintln!("downloading {path}");
                     }
@@ -1181,6 +1221,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     for f in &r.failed {
                         out!("  failed: {} ({})", f.name, f.reason);
                     }
+                    for f in &r.unavailable {
+                        out!("  not available to you: {} ({})", f.name, f.reason);
+                    }
                     for w in &r.warnings {
                         out!("  warning: {w}");
                     }
@@ -1192,6 +1235,56 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if failed > 0 {
                 anyhow::bail!("{failed} file(s) or course(s) failed to sync");
+            }
+        }
+        Command::Files(FilesCommand::Get {
+            course,
+            files,
+            root,
+        }) => {
+            let client = client(&config)?;
+            let course = canvas_api::resolve_course(&client, &course).await?;
+            let root = root.unwrap_or_else(|| config.download_root.clone());
+            let mut failed = 0;
+            let mut ids = Vec::new();
+            for text in &files {
+                match client.resolve_file(course.id, text) {
+                    Ok(id) => ids.push(id),
+                    Err(e) => {
+                        eprintln!("error: {}", clean(&e.to_string()));
+                        failed += 1;
+                    }
+                }
+            }
+            // One batch: the course's modules, Files list and pages are
+            // read once for all the files.
+            let (results, warnings) = if ids.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                canvas_sync::get_files(&client, &course, &root, &ids, canvas_sync::SYNC_LOCK_WAIT)
+                    .await?
+            };
+            for w in &warnings {
+                eprintln!("warning: {}", clean(w));
+            }
+            let mut expired = false;
+            for result in results {
+                match result {
+                    Ok(saved) if cli.json => print_json(&saved),
+                    Ok(saved) => out!("{}", saved.path.display()),
+                    // Reported once, last, as the usual sign-in message.
+                    Err(canvas_core::Error::SessionExpired) => expired = true,
+                    Err(e) => {
+                        eprintln!("error: {}", clean(&e.to_string()));
+                        failed += 1;
+                    }
+                }
+            }
+            if expired {
+                return Err(canvas_core::Error::SessionExpired.into());
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} of {} file(s) could not be saved", files.len());
             }
         }
         Command::Discussions { course, topic } => {

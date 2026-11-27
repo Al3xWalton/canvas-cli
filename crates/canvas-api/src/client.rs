@@ -157,6 +157,10 @@ impl Client {
     /// content host (`*.canvas-user-content.com`), which is fetched without
     /// it. A redirect back to the login page means the session expired.
     ///
+    /// A 401 from Canvas is checked against the user's own profile: if the
+    /// session still reads it, the download was refused
+    /// ([`Error::Forbidden`]), not signed out.
+    ///
     /// # Errors
     /// [`Error::SessionExpired`], [`Error::Forbidden`], [`Error::NotFound`],
     /// [`Error::Http`] for other failures or more than 5 redirects, and
@@ -197,7 +201,9 @@ impl Client {
                 continue;
             }
             match status {
-                StatusCode::UNAUTHORIZED if on_canvas => return Err(Error::SessionExpired),
+                StatusCode::UNAUTHORIZED if on_canvas => {
+                    return Err(self.why_unauthorized("file download").await);
+                }
                 StatusCode::FORBIDDEN => return Err(Error::Forbidden("file download".into())),
                 StatusCode::NOT_FOUND => return Err(Error::NotFound("file download".into())),
                 s if !s.is_success() => {
@@ -230,6 +236,18 @@ impl Client {
         Err(Error::Http(
             "file download redirected more than 5 times".into(),
         ))
+    }
+
+    /// Tells a refusal from a lapsed session after a 401 whose body cannot
+    /// say which (a file download answers with a web page): if the session
+    /// still reads the user's own profile, `what` was refused. If the check
+    /// itself fails another way (network, rate limit), that error is
+    /// returned rather than a guess.
+    async fn why_unauthorized(&self, what: &str) -> Error {
+        match self.current_user().await {
+            Ok(_) => Error::Forbidden(what.to_owned()),
+            Err(e) => e,
+        }
     }
 
     fn url(&self, path: &str) -> Result<url::Url> {
@@ -653,6 +671,32 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SessionExpired));
+    }
+
+    #[tokio::test]
+    async fn a_refused_download_is_not_an_expired_session() {
+        let unauthorized =
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let dest = std::env::temp_dir().join(format!("canvas-dl-401-{}", std::process::id()));
+        // The profile still loads, so the session is fine: refused.
+        let (base, requests) = serve(vec![
+            unauthorized.to_owned(),
+            ok_json(r#"{"id":7,"name":"A"}"#, None),
+        ])
+        .await;
+        let err = client(&base)
+            .download(&format!("{base}/files/1/download"), &dest, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Forbidden(_)), "{err}");
+        assert!(requests.await.unwrap()[1].starts_with("GET /api/v1/users/self "));
+        // The profile is refused too: signed out.
+        let (base, _) = serve(vec![unauthorized.to_owned(), unauthorized.to_owned()]).await;
+        let err = client(&base)
+            .download(&format!("{base}/files/1/download"), &dest, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::SessionExpired), "{err}");
     }
 
     #[tokio::test]
