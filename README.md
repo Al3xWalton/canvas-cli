@@ -102,6 +102,7 @@ command for machine-readable output.
 - `courses`, `assignments --due 7d`, `calendar --days 7d`, `grades [course]`: courses, deadlines, timetable and grades.
 - `readings <course> [--lecture "week 5"]`: each lecture's books, articles, videos and links, from Canvas modules and pages, Talis Aspire lists and Leganto lists (opened through Canvas with your session), marked essential, recommended or optional where the course says.
 - `announcements --since 14d`, `modules <course>`, `pages <course> [page] [--save]`, `discussions <course>`, `quizzes <course>`: course content as Markdown.
+- `discussions <course> <topic>`, or `discussions <link>`: read a whole discussion, with every reply threaded under the post it answers. Name the topic by its id from the list, part of its title, or its Canvas link.
 - `digest`: what's new since the last run (announcements, assignments, files, recordings), plus what's due soon.
 - `files sync <course|--all>`: download new and changed course files to `~/Canvas`.
 - `recap list <course>`, `recap info <recording>`: a course's lecture recordings, with chapters.

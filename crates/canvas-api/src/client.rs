@@ -7,11 +7,14 @@ use serde::de::DeserializeOwned;
 
 use crate::{Assignment, Course, User};
 
-/// Attempts per request, counting the first, before a rate limit is fatal.
-const MAX_ATTEMPTS: u32 = 4;
+/// Attempts per request, counting the first, before a rate limit or a 503
+/// is fatal.
+pub(crate) const MAX_ATTEMPTS: u32 = 4;
 /// Pages followed per list before giving up, as a guard against loops.
 const MAX_PAGES: usize = 200;
 /// Longest single rate-limit wait we accept, whatever `Retry-After` says.
+/// A 503 ignores `Retry-After` and waits only the short backoff, so a
+/// Canvas outage fails in seconds rather than minutes.
 const MAX_WAIT_SECS: u64 = 60;
 
 /// A read-only Canvas API client bound to one session.
@@ -20,7 +23,8 @@ pub struct Client {
     http: reqwest::Client,
     pub(crate) base: url::Url,
     cookie: String,
-    backoff: std::time::Duration,
+    /// First retry wait; it doubles on each further attempt.
+    pub(crate) backoff: std::time::Duration,
     /// The whole session, used only as the starting cookie jar for LTI
     /// launches (see `leganto`). Never logged or returned.
     pub(crate) session: Session,
@@ -232,8 +236,14 @@ impl Client {
         self.base.join(path).map_err(|e| Error::Http(e.to_string()))
     }
 
-    /// Fetches one URL with rate-limit retries, returning the body and the
-    /// raw `Link` header.
+    /// Fetches one URL, retrying rate limits and 503s, and returns the body
+    /// and the raw `Link` header.
+    ///
+    /// A redirect, or a 401 from nobody being signed in, is
+    /// [`Error::SessionExpired`]. A 401 that says the signed-in user lacks
+    /// permission (Canvas sends `"status":"unauthorized"`, e.g. for another
+    /// student's course) is [`Error::Forbidden`], so the user is not sent
+    /// to sign in again for nothing.
     async fn fetch(&self, url: url::Url, what: &str) -> Result<(String, Option<String>)> {
         let mut attempt = 0;
         loop {
@@ -247,7 +257,7 @@ impl Client {
                 .await
                 .map_err(|e| Error::Http(e.to_string()))?;
             let status = response.status();
-            if status == StatusCode::UNAUTHORIZED || status.is_redirection() {
+            if status.is_redirection() {
                 return Err(Error::SessionExpired);
             }
             let retry_after = response
@@ -264,17 +274,31 @@ impl Client {
                 .text()
                 .await
                 .map_err(|e| Error::Http(e.to_string()))?;
+            if status == StatusCode::UNAUTHORIZED {
+                let not_allowed = text.contains(r#""status":"unauthorized""#)
+                    || text.contains("not authorized to perform");
+                return Err(if not_allowed {
+                    Error::Forbidden(what.to_owned())
+                } else {
+                    Error::SessionExpired
+                });
+            }
             let limited = status == StatusCode::TOO_MANY_REQUESTS
                 || (status == StatusCode::FORBIDDEN && text.contains("Rate Limit Exceeded"));
-            if limited && attempt < MAX_ATTEMPTS {
-                if retry_after.is_some_and(|secs| secs > MAX_WAIT_SECS) {
+            // Canvas answers 503 while it prepares something, such as a
+            // discussion's reply tree, so that is worth a retry too.
+            let busy = status == StatusCode::SERVICE_UNAVAILABLE;
+            if (limited || busy) && attempt < MAX_ATTEMPTS {
+                let backoff = self.backoff * 2u32.pow(attempt - 1);
+                let wait = if busy {
+                    backoff
+                } else if retry_after.is_some_and(|secs| secs > MAX_WAIT_SECS) {
                     return Err(Error::Http(format!(
                         "GET {what} is rate limited for longer than {MAX_WAIT_SECS}s; try again later"
                     )));
-                }
-                let wait = retry_after
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or(self.backoff * 2u32.pow(attempt - 1));
+                } else {
+                    retry_after.map_or(backoff, std::time::Duration::from_secs)
+                };
                 tokio::time::sleep(wait).await;
                 continue;
             }
@@ -283,6 +307,9 @@ impl Client {
             }
             if status == StatusCode::NOT_FOUND {
                 return Err(Error::NotFound(what.to_owned()));
+            }
+            if busy {
+                return Err(Error::Unavailable(what.to_owned()));
             }
             if !status.is_success() {
                 return Err(Error::Http(format!("GET {what} returned {status}")));
@@ -478,6 +505,48 @@ pub(crate) mod tests {
         let courses = client(&base).courses().await.unwrap();
         assert_eq!(courses[0].id, 3);
         assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn permission_401_is_forbidden_not_expired() {
+        let reply = |body: &str| {
+            format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let (base, _) = serve(vec![reply(
+            r#"{"status":"unauthorized","errors":[{"message":"user not authorized to perform that action"}]}"#,
+        )])
+        .await;
+        let err = client(&base).courses().await.unwrap_err();
+        assert!(matches!(err, Error::Forbidden(_)), "{err}");
+
+        let (base, _) = serve(vec![reply(
+            r#"{"status":"unauthenticated","errors":[{"message":"user authorization required"}]}"#,
+        )])
+        .await;
+        let err = client(&base).courses().await.unwrap_err();
+        assert!(matches!(err, Error::SessionExpired), "{err}");
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_is_retried_then_explained() {
+        // Retry-After is ignored for a 503, so this does not wait an hour.
+        let busy = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 3600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
+        let (base, requests) = serve(vec![
+            busy.clone(),
+            ok_json(r#"[{"id":3,"name":"C"}]"#, None),
+        ])
+        .await;
+        assert_eq!(client(&base).courses().await.unwrap()[0].id, 3);
+        assert_eq!(requests.await.unwrap().len(), 2);
+
+        let (base, requests) = serve(vec![busy; MAX_ATTEMPTS as usize]).await;
+        let err = client(&base).courses().await.unwrap_err();
+        assert!(matches!(err, Error::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("try again in a minute"), "{err}");
+        assert_eq!(requests.await.unwrap().len(), MAX_ATTEMPTS as usize);
     }
 
     #[tokio::test]

@@ -52,10 +52,16 @@ pub enum Error {
     /// user.
     #[error("not found: {0}")]
     NotFound(String),
-    /// Canvas answered 403: the user may not see this (e.g. a hidden tab).
-    /// Distinct from [`Error::SessionExpired`], which is a 401.
+    /// Canvas answered 403, or a 401 saying the user lacks permission: the
+    /// user may not see this (e.g. a hidden tab, or another student's
+    /// course). Distinct from [`Error::SessionExpired`], where nobody is
+    /// signed in.
     #[error("not allowed: {0}")]
     Forbidden(String),
+    /// Canvas still answered 503 Service Unavailable after retries: it is
+    /// busy, or still preparing the response (e.g. a discussion's replies).
+    #[error("Canvas is busy or still preparing {0}; try again in a minute")]
+    Unavailable(String),
     /// A local file could not be written or read.
     #[error("file error at {path}: {source}")]
     Io {
