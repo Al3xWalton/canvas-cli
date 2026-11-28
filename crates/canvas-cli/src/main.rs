@@ -1254,14 +1254,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let (course, files) = if client.file_target(None, &course).is_ok() {
                 (None, std::iter::once(course).chain(files).collect())
             } else if files.is_empty() {
-                use clap::CommandFactory;
-                Cli::command()
-                    .error(
-                        clap::error::ErrorKind::MissingRequiredArgument,
-                        "no files to download: give a course and then file ids or links, \
-                         or links alone",
-                    )
-                    .exit();
+                no_files_error().exit();
             } else {
                 (Some(course), files)
             };
@@ -1512,6 +1505,22 @@ async fn recap_targets(
     Ok((t.dir, t.ids))
 }
 
+/// The usage error for `files get` given a course and no files, shown with
+/// `files get`'s own usage line rather than the top-level one.
+fn no_files_error() -> clap::Error {
+    use clap::CommandFactory;
+    let mut cli = Cli::command();
+    cli.build();
+    let get = cli
+        .find_subcommand_mut("files")
+        .and_then(|files| files.find_subcommand_mut("get"))
+        .expect("`files get` is a subcommand");
+    get.error(
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "no files to download: give a course and then file ids or links, or links alone",
+    )
+}
+
 /// Builds an API client from the stored session.
 fn client(config: &Config) -> anyhow::Result<canvas_api::Client> {
     let session = canvas_auth::load()?;
@@ -1652,7 +1661,19 @@ fn until(t: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean, shell_quote};
+    use super::{clean, no_files_error, shell_quote};
+
+    #[test]
+    fn files_get_without_files_shows_its_own_usage() {
+        let error = no_files_error();
+        let text = error.render().to_string();
+        assert!(text.contains("no files to download"), "{text}");
+        assert!(
+            text.contains("Usage: canvas files get [OPTIONS] <COURSE|FILE> [FILE]..."),
+            "{text}"
+        );
+        assert_eq!(error.exit_code(), 2);
+    }
 
     #[test]
     fn clean_strips_escape_codes_but_keeps_layout() {
