@@ -151,6 +151,8 @@ impl Client {
 
     /// Downloads `url` into `dest`, returning the number of bytes written.
     /// If `expected` is given, a body of any other length is an error.
+    /// Without it, a body cut short of the `Content-Length` the server
+    /// announced is still an error (the HTTP layer refuses it).
     ///
     /// The session cookie is sent only while the URL is on the Canvas
     /// origin. Canvas answers file downloads with a redirect to a separate
@@ -713,6 +715,23 @@ pub(crate) mod tests {
         assert_eq!(n, 5);
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_a_size_the_download_is_checked_against_its_length() {
+        let (base, _) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_owned(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nhel".to_owned(),
+        ])
+        .await;
+        let dest = std::env::temp_dir().join(format!("canvas-dl-nosize-{}", std::process::id()));
+        let c = client(&base);
+        assert_eq!(
+            c.download(&format!("{base}/f"), &dest, None).await.unwrap(),
+            5
+        );
+        assert!(c.download(&format!("{base}/f"), &dest, None).await.is_err());
+        let _ = std::fs::remove_file(&dest);
     }
 
     #[tokio::test]
