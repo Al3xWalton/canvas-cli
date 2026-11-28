@@ -39,7 +39,7 @@ pub use academic::{AssignmentGrade, CalendarEvent, CourseGrade, Quiz};
 pub use client::Client;
 pub use content::{Announcement, Discussion, Module, ModuleItem, Page, PageSummary};
 pub use discussion::{DiscussionEntry, DiscussionRef, DiscussionThread, resolve_discussion};
-pub use files::{CanvasFile, Folder};
+pub use files::{CanvasFile, FileTarget, Folder, UserFile};
 pub use markdown::html_to_markdown;
 pub use queries::{UpcomingAssignment, parse_window, resolve_course, upcoming_assignments};
 pub use readings::{

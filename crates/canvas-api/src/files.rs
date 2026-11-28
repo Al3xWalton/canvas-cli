@@ -1,4 +1,4 @@
-//! Course files and folders, and links to files.
+//! Course files and folders, the user's own files, and links to files.
 //!
 //! Many universities refuse the Files list to students
 //! with a 403 while still linking files from modules and from inside
@@ -9,8 +9,9 @@
 //! A file link is `/courses/<course>/files/<file>` on the Canvas site, with
 //! any tail (`?wrap=1`, `/preview`, `/download?download_frd=1`), the
 //! `/api/v1` form, or the Files tab's `/courses/<course>/files?preview=<file>`.
-//! It may be absolute or relative to the site. Only the ids are read from a
-//! link; nothing is ever fetched from it.
+//! A link into a user's own files is `/users/<user>/files/<file>`, with the
+//! same tails. Either may be absolute or relative to the site. Only the ids
+//! are read from a link; nothing is ever fetched from it.
 
 use std::sync::LazyLock;
 
@@ -65,14 +66,52 @@ pub struct CanvasFile {
     pub lock_explanation: Option<String>,
 }
 
-/// A course folder, used to place files on disk.
+/// A folder of a course or a user, used to place files on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Folder {
     /// Folder id.
     pub id: u64,
-    /// Path inside the course, e.g. `course files/Lectures/Week 1`.
+    /// Path from the top folder, e.g. `course files/Lectures/Week 1`, or
+    /// `my files/Notes` in a user's own files.
     #[serde(default)]
     pub full_name: String,
+    /// What holds the folder: `Course`, `User` or `Group`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_type: Option<String>,
+    /// The id of the course, user or group holding it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<u64>,
+}
+
+/// A file in a user's own files, as a `/users/<user>/files/<file>` link
+/// names it. The user id is only what the link says; who really holds the
+/// file is its folder's [`Folder::context_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserFile {
+    /// The user the link names.
+    pub user_id: u64,
+    /// File id.
+    pub file_id: u64,
+}
+
+/// What a file argument (an id or a link) names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTarget {
+    /// A file of a course.
+    Course {
+        /// Course id.
+        course_id: u64,
+        /// File id.
+        file_id: u64,
+    },
+    /// A file in a user's own files.
+    User(UserFile),
+}
+
+/// The ids a file link names.
+enum Link {
+    Course(u64, u64),
+    User(UserFile),
 }
 
 impl Client {
@@ -95,6 +134,16 @@ impl Client {
             .await
     }
 
+    /// Fetches one file's metadata by its id alone, from
+    /// `GET /api/v1/files/<id>`, wherever it lives. Used for the user's own
+    /// files, which belong to no course.
+    ///
+    /// # Errors
+    /// As for [`Client::get`].
+    pub async fn file_by_id(&self, file_id: u64) -> Result<CanvasFile> {
+        self.get(&format!("/api/v1/files/{file_id}")).await
+    }
+
     /// Lists a course's folders.
     ///
     /// # Errors
@@ -104,35 +153,67 @@ impl Client {
             .await
     }
 
+    /// Fetches one folder, with what holds it.
+    ///
+    /// # Errors
+    /// As for [`Client::get`].
+    pub async fn folder(&self, folder_id: u64) -> Result<Folder> {
+        self.get(&format!("/api/v1/folders/{folder_id}")).await
+    }
+
     /// Reads `(course id, file id)` from a file link on this Canvas site,
     /// e.g. `https://canvas.example.edu/courses/1/files/42?wrap=1`,
     /// `/courses/1/files/42/download` or `canvas.example.edu/courses/1/files/42`,
     /// optionally in `<>` or quotes as pasted. `None` for anything else,
     /// including a file link on another site.
     pub fn file_link(&self, text: &str) -> Option<(u64, u64)> {
+        match self.any_file_link(text)? {
+            Link::Course(course, file) => Some((course, file)),
+            Link::User(_) => None,
+        }
+    }
+
+    /// Reads a course file link, or a `/users/<user>/files/<file>` link
+    /// into a user's own files, on this Canvas site.
+    fn any_file_link(&self, text: &str) -> Option<Link> {
         let text = text.trim().trim_matches(['<', '>', '"', '\'']).trim();
         file_ids(&self.site_url(text)?)
     }
 
-    /// The file id in `text`, which is a file id (`12345678`) or a file
-    /// link in course `course_id`.
+    /// What a file argument names: a file id (`12345678`), which needs
+    /// `course_id`; a file link in that course (or in any course when
+    /// `course_id` is `None`); or a link into a user's own files, which
+    /// belong to no course.
     ///
     /// # Errors
-    /// [`Error::Input`] if `text` is neither, or links a file in another
-    /// course.
-    pub fn resolve_file(&self, course_id: u64, text: &str) -> Result<u64> {
+    /// [`Error::Input`] if `text` is none of these, is an id without a
+    /// course, or links a file in a course other than `course_id`.
+    pub fn file_target(&self, course_id: Option<u64>, text: &str) -> Result<FileTarget> {
         let text = text.trim();
-        if let Ok(id) = text.parse::<u64>() {
-            return Ok(id);
+        if let Ok(file_id) = text.parse::<u64>() {
+            return match course_id {
+                Some(course_id) => Ok(FileTarget::Course { course_id, file_id }),
+                None => Err(Error::Input(format!(
+                    "`{text}` is a file id, which needs its course; give the course too, \
+                     or a file link instead"
+                ))),
+            };
         }
-        match self.file_link(text) {
-            Some((course, file)) if course == course_id => Ok(file),
-            Some((course, _)) => Err(Error::Input(format!(
-                "`{text}` is a file in course {course}, not course {course_id}"
+        match self.any_file_link(text) {
+            Some(Link::Course(course, file_id)) if course_id.is_none_or(|c| c == course) => {
+                Ok(FileTarget::Course {
+                    course_id: course,
+                    file_id,
+                })
+            }
+            Some(Link::Course(course, _)) => Err(Error::Input(format!(
+                "`{text}` is a file in course {course}, not course {}",
+                course_id.unwrap_or_default()
             ))),
+            Some(Link::User(file)) => Ok(FileTarget::User(file)),
             None => Err(Error::Input(format!(
                 "`{text}` is not a file id or a file link on your Canvas site \
-                 (…/courses/<id>/files/<id>)"
+                 (…/courses/<id>/files/<id> or …/users/<id>/files/<id>)"
             ))),
         }
     }
@@ -186,9 +267,9 @@ impl Client {
     }
 }
 
-/// The course and file ids in a file link's path (and, for the Files
-/// tab's preview, its query).
-fn file_ids(url: &url::Url) -> Option<(u64, u64)> {
+/// The course (or user) and file ids in a file link's path (and, for the
+/// Files tab's preview, its query).
+fn file_ids(url: &url::Url) -> Option<Link> {
     let parts: Vec<&str> = url.path_segments()?.filter(|p| !p.is_empty()).collect();
     let parts = match parts.as_slice() {
         ["api", "v1", rest @ ..] => rest,
@@ -196,7 +277,13 @@ fn file_ids(url: &url::Url) -> Option<(u64, u64)> {
     };
     match parts {
         ["courses", course, "files", file, ..] if is_id(file) => {
-            Some((course.parse().ok()?, file.parse().ok()?))
+            Some(Link::Course(course.parse().ok()?, file.parse().ok()?))
+        }
+        ["users", user, "files", file, ..] if is_id(user) && is_id(file) => {
+            Some(Link::User(UserFile {
+                user_id: user.parse().ok()?,
+                file_id: file.parse().ok()?,
+            }))
         }
         // The Files tab previewing a file: `files?preview=42`, also inside
         // a folder (`files/folder/Week 1?preview=42`).
@@ -208,7 +295,7 @@ fn file_ids(url: &url::Url) -> Option<(u64, u64)> {
             if !is_id(&preview) {
                 return None;
             }
-            Some((course.parse().ok()?, preview.parse().ok()?))
+            Some(Link::Course(course.parse().ok()?, preview.parse().ok()?))
         }
         _ => None,
     }
@@ -300,16 +387,60 @@ mod tests {
     async fn file_arguments_are_ids_or_links_in_the_course() {
         let c = site().await;
         let base = base_of(&c);
-        assert_eq!(c.resolve_file(70, " 12345678 ").unwrap(), 12_345_678);
+        let course = |course_id, file_id| FileTarget::Course { course_id, file_id };
+        assert_eq!(
+            c.file_target(Some(70), " 12345678 ").unwrap(),
+            course(70, 12_345_678)
+        );
         let link = format!("{base}/courses/70/files/42?wrap=1");
-        assert_eq!(c.resolve_file(70, &link).unwrap(), 42);
-        let err = c.resolve_file(71, &link).unwrap_err().to_string();
+        assert_eq!(c.file_target(Some(70), &link).unwrap(), course(70, 42));
+        // Without a course, a link names its own.
+        assert_eq!(c.file_target(None, &link).unwrap(), course(70, 42));
+        let err = c.file_target(Some(71), &link).unwrap_err().to_string();
         assert!(err.contains("course 70, not course 71"), "{err}");
-        assert!(c.resolve_file(70, "slides.pdf").is_err());
+        let err = c.file_target(None, "42").unwrap_err().to_string();
+        assert!(err.contains("needs its course"), "{err}");
+        assert!(c.file_target(Some(70), "slides.pdf").is_err());
         assert!(
-            c.resolve_file(70, "https://other.example/courses/70/files/42")
+            c.file_target(Some(70), "https://other.example/courses/70/files/42")
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn user_file_links_name_the_user_and_file_in_any_course() {
+        let c = site().await;
+        let base = base_of(&c);
+        let mine = FileTarget::User(UserFile {
+            user_id: 9,
+            file_id: 42,
+        });
+        for link in [
+            "/users/9/files/42".to_owned(),
+            "/users/9/files/42?wrap=1".to_owned(),
+            "/users/9/files/42/download?download_frd=1".to_owned(),
+            "/users/9/files/42/preview?verifier=v".to_owned(),
+            format!("{base}/users/9/files/42"),
+            format!("{base}/api/v1/users/9/files/42"),
+            format!("<{base}/users/9/files/42>"),
+        ] {
+            // A course given alongside does not matter: these belong to none.
+            for course_id in [None, Some(70)] {
+                assert_eq!(c.file_target(course_id, &link).unwrap(), mine, "{link}");
+            }
+            // Never taken for a course file, so pages do not list them.
+            assert_eq!(c.file_link(&link), None, "{link}");
+        }
+        for not_a_file in [
+            "/users/9/files".to_owned(),
+            "/users/9/files?preview=42".to_owned(),
+            "/users/self/files/42".to_owned(),
+            "/users/9/files/4x2".to_owned(),
+            "https://other.example/users/9/files/42".to_owned(),
+            "/users/9/pages/42".to_owned(),
+        ] {
+            assert!(c.file_target(None, &not_a_file).is_err(), "{not_a_file}");
+        }
     }
 
     #[tokio::test]
@@ -329,7 +460,8 @@ mod tests {
             <p>Files tab: <a href="/courses/70/files?preview=51">preview</a></p>
             <p><a title="Week 1 > Slides" href="/courses/70/files/52">angle in a title</a></p>
             <p><a title=" href=/courses/70/files/53" href="/courses/70/files/54">href in a title</a></p>
-            <p><a href="/courses/70/files?x=1&#38;preview=55">encoded</a></p>"#
+            <p><a href="/courses/70/files?x=1&#38;preview=55">encoded</a></p>
+            <p>Someone's own files: <a href="{base}/users/9/files/56?verifier=v">mine</a></p>"#
         );
         assert_eq!(
             c.linked_files(70, &html),

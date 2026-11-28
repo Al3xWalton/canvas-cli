@@ -282,13 +282,18 @@ enum FilesCommand {
         root: Option<std::path::PathBuf>,
     },
     /// Download particular files, e.g. ones linked from inside a page, to
-    /// where a sync would put them. With --json, prints one JSON object
-    /// per file.
+    /// where a sync would put them. Links into your own files
+    /// (`…/users/<id>/files/<id>`) are saved under `My files/`. With
+    /// --json, prints one JSON object per file.
     Get {
-        /// Course id, code or part of the name.
+        /// Course id, code or part of the name. Leave it out when every
+        /// file is a link: the first link then goes here.
+        #[arg(value_name = "COURSE|FILE")]
         course: String,
-        /// File ids (12345678) or Canvas file links (`…/courses/<id>/files/<id>`).
-        #[arg(required = true)]
+        /// File ids (12345678), course file links
+        /// (`…/courses/<id>/files/<id>`), or links into your own files
+        /// (`…/users/<id>/files/<id>`).
+        #[arg(value_name = "FILE")]
         files: Vec<String>,
         /// Download here instead of the configured download_root.
         #[arg(long)]
@@ -1243,30 +1248,35 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             root,
         }) => {
             let client = client(&config)?;
-            let course = canvas_api::resolve_course(&client, &course).await?;
             let root = root.unwrap_or_else(|| config.download_root.clone());
-            let mut failed = 0;
-            let mut ids = Vec::new();
-            for text in &files {
-                match client.resolve_file(course.id, text) {
-                    Ok(id) => ids.push(id),
-                    Err(e) => {
-                        eprintln!("error: {}", clean(&e.to_string()));
-                        failed += 1;
-                    }
-                }
-            }
-            // One batch: the course's modules, Files list and pages are
-            // read once for all the files.
-            let (results, warnings) = if ids.is_empty() {
-                (Vec::new(), Vec::new())
+            // A link first means no course was given: each link names its
+            // own course, or the user's own files.
+            let (course, files) = if client.file_target(None, &course).is_ok() {
+                (None, std::iter::once(course).chain(files).collect())
+            } else if files.is_empty() {
+                use clap::CommandFactory;
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "no files to download: give a course and then file ids or links, \
+                         or links alone",
+                    )
+                    .exit();
             } else {
-                canvas_sync::get_files(&client, &course, &root, &ids, canvas_sync::SYNC_LOCK_WAIT)
-                    .await?
+                (Some(course), files)
             };
+            let (results, warnings) = canvas_sync::get(
+                &client,
+                &root,
+                course.as_deref(),
+                &files,
+                canvas_sync::SYNC_LOCK_WAIT,
+            )
+            .await?;
             for w in &warnings {
                 eprintln!("warning: {}", clean(w));
             }
+            let mut failed = 0;
             let mut expired = false;
             for result in results {
                 match result {

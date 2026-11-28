@@ -34,6 +34,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 ///
 /// Course 5 (`RPL`): page `deck` in module `Week 2` links file 78, which
 /// was replaced: Canvas answers id 78 with file 79's record.
+///
+/// The signed-in user is 500. Their own files (`/api/v1/files/<id>`):
+/// 90 and 91 are both `Notes.pdf` in folder `my files/Coursework`; 92 sits
+/// in a course folder; 93 in user 501's folder; 88 and 89 in a group's
+/// and a course's folder whose ids happen to be 500 too; 94's folder has a
+/// hostile name; 95's folder cannot be read; 87's folder answers garbage;
+/// 96 and 97 no longer exist. The user's courses are 1 and 4.
 struct Fake {
     base: String,
     hits: Arc<Mutex<Vec<String>>>,
@@ -131,6 +138,30 @@ fn route(me: &str, path: &str) -> (&'static str, String) {
         "/api/v1/courses/5/files/78" | "/api/v1/courses/5/files/79" => {
             ok(file(5, 79, "Deck.pdf", 4, 99))
         }
+        "/api/v1/users/self" => ok(r#"{"id":500,"name":"Test Student"}"#.to_owned()),
+        "/api/v1/courses" => ok(r#"[{"id":1,"name":"ABC1020","course_code":"ABC1020"},{"id":4,"name":"QRS","course_code":"QRS"}]"#.to_owned()),
+        "/api/v1/files/87" => ok(file(0, 87, "Odd.pdf", 1, 907)),
+        "/api/v1/files/88" => ok(file(0, 88, "Group.pdf", 1, 908)),
+        "/api/v1/files/89" => ok(file(0, 89, "Course.pdf", 1, 909)),
+        "/api/v1/folders/907" => ok("not json".to_owned()),
+        "/api/v1/folders/908" => ok(r#"{"id":908,"full_name":"files","context_type":"Group","context_id":500}"#.to_owned()),
+        "/api/v1/folders/909" => ok(r#"{"id":909,"full_name":"course files","context_type":"Course","context_id":500}"#.to_owned()),
+        "/api/v1/files/90" => ok(file(0, 90, "Notes.pdf", 4, 900)),
+        "/api/v1/files/91" => ok(file(0, 91, "Notes.pdf", 4, 900)),
+        "/api/v1/files/92" => ok(file(0, 92, "Course.pdf", 1, 902)),
+        "/api/v1/files/93" => ok(file(0, 93, "Theirs.pdf", 1, 903)),
+        "/api/v1/files/94" => ok(file(0, 94, "../Up.pdf", 3, 904)),
+        "/api/v1/files/95" => ok(file(0, 95, "Odd.pdf", 1, 905)),
+        "/api/v1/folders/900" => ok(r#"{"id":900,"full_name":"my files/Coursework","context_type":"User","context_id":500}"#.to_owned()),
+        "/api/v1/folders/902" => ok(r#"{"id":902,"full_name":"course files","context_type":"Course","context_id":1}"#.to_owned()),
+        "/api/v1/folders/903" => ok(r#"{"id":903,"full_name":"my files","context_type":"User","context_id":501}"#.to_owned()),
+        "/api/v1/folders/904" => ok(r#"{"id":904,"full_name":"my files/../../escape","context_type":"User","context_id":500}"#.to_owned()),
+        "/dl/90" => ok("own1".to_owned()),
+        "/dl/91" => ok("own2".to_owned()),
+        "/dl/92" => ok("c".to_owned()),
+        "/dl/93" => ok("t".to_owned()),
+        "/dl/94" => ok("up!".to_owned()),
+        "/dl/95" => ok("o".to_owned()),
         "/dl/79" => ok("deck".to_owned()),
         "/dl/5" => ok("hello".to_owned()),
         "/dl/6" => ok("world".to_owned()),
@@ -189,6 +220,33 @@ fn root(name: &str) -> (PathBuf, PathBuf) {
 fn manifest(root: &Path, course: u64) -> serde_json::Value {
     let text = std::fs::read_to_string(root.join(format!(".canvas-sync/{course}.json"))).unwrap();
     serde_json::from_str(&text).unwrap()
+}
+
+/// A link into user `user_id`'s own files.
+fn own(user_id: u64, file_id: u64) -> canvas_api::UserFile {
+    canvas_api::UserFile { user_id, file_id }
+}
+
+/// Gets the user's own files; each result is the saved path relative to
+/// `root`, or the error.
+async fn get_own(
+    client: &canvas_api::Client,
+    root: &Path,
+    files: &[canvas_api::UserFile],
+) -> Vec<Result<(String, bool), Error>> {
+    let (results, _) = canvas_sync::get_own_files(client, root, files, canvas_sync::GET_LOCK_WAIT)
+        .await
+        .unwrap();
+    let canonical = root.canonicalize().unwrap();
+    results
+        .into_iter()
+        .map(|r| {
+            r.map(|s| {
+                let rel = s.path.strip_prefix(&canonical).unwrap();
+                (rel.to_string_lossy().into_owned(), s.downloaded)
+            })
+        })
+        .collect()
 }
 
 fn read(root: &Path, rel: &str) -> String {
@@ -830,4 +888,222 @@ async fn locked_refused_missing_and_expired_say_why() {
     assert!(results[0].is_ok());
     assert!(matches!(results[1], Err(Error::SessionExpired)));
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn own_files_save_under_my_files_and_keep_their_names() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, canonical) = root("own");
+    let first = get_own(&c, &root, &[own(500, 90), own(500, 91)]).await;
+    let plain = "My files/Coursework/Notes.pdf".to_owned();
+    let second = "My files/Coursework/Notes (91).pdf".to_owned();
+    assert_eq!(
+        first.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+        vec![(plain.clone(), true), (second.clone(), true)]
+    );
+    assert_eq!(read(&canonical, &plain), "own1");
+    assert_eq!(read(&canonical, &second), "own2");
+    // Recorded in the user's own manifest, not a course's.
+    let text = std::fs::read_to_string(canonical.join(".canvas-sync/own.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(m["files"]["90"]["path"], plain.as_str());
+    assert_eq!(m["files"]["91"]["path"], second.as_str());
+    // Again, in the other order: nothing downloaded, names unchanged.
+    let again = get_own(&c, &root, &[own(500, 91), own(500, 90)]).await;
+    assert_eq!(
+        again.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+        vec![(second, false), (plain, false)]
+    );
+}
+
+#[tokio::test]
+async fn only_your_own_files_are_fetched() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, canonical) = root("own-only");
+    let results = get_own(
+        &c,
+        &root,
+        &[
+            own(501, 93),
+            own(500, 93),
+            own(500, 92),
+            own(500, 95),
+            own(500, 96),
+            own(500, 88),
+            own(500, 89),
+            own(500, 87),
+        ],
+    )
+    .await;
+    let errors: Vec<String> = results
+        .into_iter()
+        .map(|r| r.unwrap_err().to_string())
+        .collect();
+    // Another user's link is refused before Canvas is asked about it.
+    assert!(
+        errors[0].contains("files of user 501, not yours"),
+        "{}",
+        errors[0]
+    );
+    // Held by another user, or by a course: refused after checking.
+    assert!(errors[1].contains("not in your own files"), "{}", errors[1]);
+    assert!(errors[2].contains("not in your own files"), "{}", errors[2]);
+    assert!(
+        errors[3].contains("could not be checked as yours"),
+        "{}",
+        errors[3]
+    );
+    assert!(errors[4].contains("may have been deleted"), "{}", errors[4]);
+    // A group's or a course's folder is not the user's, whatever its id.
+    assert!(errors[5].contains("not in your own files"), "{}", errors[5]);
+    assert!(errors[6].contains("not in your own files"), "{}", errors[6]);
+    // A bad answer is passed on as it is, not read as a refusal.
+    assert!(errors[7].contains("unexpected response"), "{}", errors[7]);
+    assert!(!errors[7].contains("only your own"), "{}", errors[7]);
+    assert_eq!(fake.count("/api/v1/files/93"), 1);
+    // Nothing of theirs (or the course's) was downloaded.
+    for dl in ["/dl/87", "/dl/88", "/dl/89", "/dl/92", "/dl/93", "/dl/95"] {
+        assert_eq!(fake.count(dl), 0, "{dl}");
+    }
+    assert!(!canonical.join("My files").exists());
+}
+
+#[tokio::test]
+async fn an_own_file_takes_the_name_of_one_canvas_no_longer_has() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, canonical) = root("own-gone");
+    // An earlier get saved file 97 as Notes.pdf; Canvas no longer has it.
+    let plain = "My files/Coursework/Notes.pdf";
+    std::fs::create_dir_all(canonical.join("My files/Coursework")).unwrap();
+    std::fs::write(canonical.join(plain), "old").unwrap();
+    std::fs::create_dir_all(canonical.join(".canvas-sync")).unwrap();
+    std::fs::write(
+        canonical.join(".canvas-sync/own.json"),
+        serde_json::json!({"files": {"97": {"path": plain, "size": 3, "updated_at": null, "linked": true}}})
+            .to_string(),
+    )
+    .unwrap();
+    let saved = get_own(&c, &root, &[own(500, 90)]).await;
+    assert_eq!(saved[0].as_ref().unwrap().0, plain);
+    assert_eq!(read(&canonical, plain), "own1");
+    // Asked once, by id alone (own files belong to no course).
+    assert_eq!(fake.count("/api/v1/files/97"), 1);
+    let text = std::fs::read_to_string(canonical.join(".canvas-sync/own.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(m["files"].get("97").is_none(), "{m}");
+}
+
+#[tokio::test]
+async fn hostile_own_folder_names_stay_inside_the_root() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, canonical) = root("own-hostile");
+    let saved = get_own(&c, &root, &[own(500, 94)]).await;
+    let rel = saved[0].as_ref().unwrap().0.clone();
+    assert!(rel.starts_with("My files/"), "{rel}");
+    assert!(!rel.contains(".."), "{rel}");
+    assert_eq!(read(&canonical, &rel), "up!");
+}
+
+/// Runs `canvas_sync::get`; each result is the saved path relative to
+/// `root`, or the error's text.
+async fn get_named(
+    client: &canvas_api::Client,
+    root: &Path,
+    course: Option<&str>,
+    files: &[&str],
+) -> Vec<Result<String, String>> {
+    let files: Vec<String> = files.iter().map(|f| (*f).to_owned()).collect();
+    let (results, _) = canvas_sync::get(client, root, course, &files, canvas_sync::GET_LOCK_WAIT)
+        .await
+        .unwrap();
+    let canonical = root.canonicalize().unwrap();
+    results
+        .into_iter()
+        .map(|r| {
+            r.map(|s| {
+                s.path
+                    .strip_prefix(&canonical)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn get_sends_each_link_where_it_belongs_in_argument_order() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, _) = root("get-order");
+    let base = fake.base.clone();
+    let results = get_named(
+        &c,
+        &root,
+        None,
+        &[
+            &format!("{base}/users/500/files/90?verifier=v"),
+            "/courses/1/files/5",
+            "6",
+            "/courses/4/files/30",
+            "/courses/1/files/10/download",
+            "/courses/77/files/1",
+        ],
+    )
+    .await;
+    assert_eq!(results[0].as_deref(), Ok("My files/Coursework/Notes.pdf"));
+    assert_eq!(results[1].as_deref(), Ok("ABC1020/Lectures/Slides.pdf"));
+    assert!(
+        results[2]
+            .as_ref()
+            .unwrap_err()
+            .contains("needs its course")
+    );
+    assert_eq!(results[3].as_deref(), Ok("QRS/Week 1/Notes.pdf"));
+    assert_eq!(
+        results[4].as_deref(),
+        Ok("ABC1020/Lectures/Slides (10).pdf")
+    );
+    let err = results[5].as_ref().unwrap_err();
+    assert!(err.contains("no active course with id 77"), "{err}");
+    // The course list is read once for every course link.
+    assert_eq!(fake.count("/api/v1/courses"), 1);
+}
+
+#[tokio::test]
+async fn a_given_course_is_looked_up_only_when_a_file_needs_it() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, _) = root("get-course");
+    // Own files belong to no course: a course given alongside is not read.
+    let results = get_named(&c, &root, Some("NOPE"), &["/users/500/files/90"]).await;
+    assert_eq!(results[0].as_deref(), Ok("My files/Coursework/Notes.pdf"));
+    assert_eq!(fake.count("/api/v1/courses"), 0);
+    // A file id needs it, so a course that matches nothing fails the call.
+    let files = vec!["5".to_owned()];
+    let err = canvas_sync::get(&c, &root, Some("NOPE"), &files, canvas_sync::GET_LOCK_WAIT)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no active course matches"), "{err}");
+    // With the course: ids are its files, and links to other courses fail.
+    let results = get_named(
+        &c,
+        &root,
+        Some("ABC1020"),
+        &["5", "/users/500/files/91", "/courses/4/files/30"],
+    )
+    .await;
+    assert_eq!(results[0].as_deref(), Ok("ABC1020/Lectures/Slides.pdf"));
+    assert_eq!(
+        results[1].as_deref(),
+        Ok("My files/Coursework/Notes (91).pdf")
+    );
+    let err = results[2].as_ref().unwrap_err();
+    assert!(err.contains("course 4, not course 1"), "{err}");
 }
