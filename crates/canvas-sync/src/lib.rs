@@ -177,8 +177,13 @@ struct Manifest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Entry {
     path: String,
+    /// The size Canvas reports, compared to tell whether the file changed.
     size: u64,
     updated_at: Option<DateTime<Utc>>,
+    /// The size of the local copy, when it is not `size`: Canvas reports
+    /// media files at another size than it sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
     /// True for a file outside the Files list and module items: found
     /// through a page link, or fetched by a get. A plain sync does not see
     /// these files, so it keeps clear of their paths.
@@ -925,16 +930,18 @@ pub async fn sync_course(
             });
             continue;
         }
-        let entry = Entry {
+        let mut entry = Entry {
             path: rel_text.clone(),
             size: file.size,
             updated_at: file.updated_at,
             linked: is_page(file.id),
+            bytes: None,
         };
         let previous = manifest.files.get(&file.id);
         if is_current(previous, &entry, &dest) {
             report.unchanged += 1;
-            if previous.is_some_and(|p| p.linked != entry.linked) {
+            if let Some(p) = previous.filter(|p| p.linked != entry.linked) {
+                entry.bytes = p.bytes;
                 changes.insert(file.id, entry);
             }
             continue;
@@ -945,6 +952,7 @@ pub async fn sync_course(
             Ok(bytes) => {
                 report.bytes += bytes;
                 report.downloaded.push(rel_text);
+                entry.bytes = (bytes != entry.size).then_some(bytes);
                 changes.insert(file.id, entry);
             }
             Err(e) => {
@@ -1579,17 +1587,18 @@ async fn save_one(
             root.display()
         )));
     }
-    let entry = Entry {
+    let mut entry = Entry {
         path: rel.to_string_lossy().into_owned(),
         size: file.size,
         updated_at: file.updated_at,
         linked,
+        bytes: None,
     };
     let previous = manifest.files.get(&id);
     let downloaded = !is_current(previous, &entry, &dest);
     let relabel = previous.is_some_and(|p| p.linked != linked);
     if downloaded {
-        fetch_into(client, &file, &store.tmp, &dest)
+        let bytes = fetch_into(client, &file, &store.tmp, &dest)
             .await
             .map_err(|e| match e {
                 Error::Forbidden(_) => Error::Forbidden(format!(
@@ -1602,7 +1611,11 @@ async fn save_one(
                 )),
                 other => other,
             })?;
+        entry.bytes = (bytes != entry.size).then_some(bytes);
+    } else {
+        entry.bytes = previous.and_then(|p| p.bytes);
     }
+    let size = entry.bytes.unwrap_or(entry.size);
     if downloaded || relabel {
         store.merge(&BTreeMap::from([(id, entry.clone())]), warnings)?;
         record(manifest, id, entry);
@@ -1611,7 +1624,7 @@ async fn save_one(
         path: dest,
         id,
         name: file.display_name,
-        size: file.size,
+        size,
         updated_at: file.updated_at,
         downloaded,
         warnings: Vec::new(),
@@ -1619,15 +1632,21 @@ async fn save_one(
 }
 
 /// True if the manifest's `previous` entry matches `entry` (same path,
-/// size and change time) and the local copy at `dest` has that size.
+/// size and change time) and the local copy at `dest` has the size
+/// recorded for it.
 fn is_current(previous: Option<&Entry>, entry: &Entry, dest: &Path) -> bool {
     previous.is_some_and(|p| {
-        p.path == entry.path && p.size == entry.size && p.updated_at == entry.updated_at
-    }) && std::fs::metadata(dest).is_ok_and(|m| m.len() == entry.size)
+        p.path == entry.path
+            && p.size == entry.size
+            && p.updated_at == entry.updated_at
+            && std::fs::metadata(dest).is_ok_and(|m| m.len() == p.bytes.unwrap_or(p.size))
+    })
 }
 
-/// Downloads `file` to a unique temp file in `tmp_dir`, checks its size,
-/// and renames it to `dest`. The temp file is removed on failure.
+/// Downloads `file` to a unique temp file in `tmp_dir`, checks its size
+/// against Canvas's (except for media files, see
+/// [`CanvasFile::media_entry_id`]), and renames it to `dest`. The temp file is removed on failure. Returns the
+/// bytes written.
 async fn fetch_into(
     client: &Client,
     file: &CanvasFile,
@@ -1639,7 +1658,10 @@ async fn fetch_into(
     // writer fetching the same file; same file system, so the rename
     // stays atomic.
     let part = tmp_dir.join(temp_name(&file.id.to_string()));
-    let outcome = match client.download(&file.url, &part, Some(file.size)).await {
+    // A media file's reported size need not be what Canvas sends; its
+    // download is still refused if cut short of its announced length.
+    let expected = file.media_entry_id.is_none().then_some(file.size);
+    let outcome = match client.download(&file.url, &part, expected).await {
         Ok(bytes) => dest
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
@@ -1765,6 +1787,7 @@ mod tests {
             size: 1,
             updated_at: None,
             linked: false,
+            bytes: None,
         }
     }
 

@@ -40,7 +40,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// in a course folder; 93 in user 501's folder; 88 and 89 in a group's
 /// and a course's folder whose ids happen to be 500 too; 94's folder has a
 /// hostile name; 95's folder cannot be read; 87's folder answers garbage;
-/// 96 and 97 no longer exist. The user's courses are 1 and 4.
+/// 96 and 97 no longer exist; 86 is a video Canvas reports at 2 bytes but
+/// sends at 14. The user's courses are 1 and 4.
+///
+/// Course 6 (`MED`) shows its Files list, which holds video 61: reported at
+/// 1 byte, sent at 9.
 struct Fake {
     base: String,
     hits: Arc<Mutex<Vec<String>>>,
@@ -140,6 +144,16 @@ fn route(me: &str, path: &str) -> (&'static str, String) {
         }
         "/api/v1/users/self" => ok(r#"{"id":500,"name":"Test Student"}"#.to_owned()),
         "/api/v1/courses" => ok(r#"[{"id":1,"name":"ABC1020","course_code":"ABC1020"},{"id":4,"name":"QRS","course_code":"QRS"}]"#.to_owned()),
+        "/api/v1/files/86" => ok(format!(
+            r#"{{"id":86,"display_name":"Clip.mp4","size":2,"updated_at":"2026-11-01T00:00:00Z","folder_id":900,"url":"{me}/dl/86","media_entry_id":"m-1"}}"#
+        )),
+        "/api/v1/courses/6/files" => ok(format!(
+            r#"[{{"id":61,"display_name":"Talk.mp4","size":1,"updated_at":"2026-11-01T00:00:00Z","folder_id":60,"url":"{me}/dl/61","media_entry_id":"m-2"}}]"#
+        )),
+        "/api/v1/courses/6/folders" => ok(r#"[{"id":60,"full_name":"course files"}]"#.to_owned()),
+        "/api/v1/courses/6/modules" => ok("[]".to_owned()),
+        "/dl/86" => ok("a longer video".to_owned()),
+        "/dl/61" => ok("the video".to_owned()),
         "/api/v1/files/87" => ok(file(0, 87, "Odd.pdf", 1, 907)),
         "/api/v1/files/88" => ok(file(0, 88, "Group.pdf", 1, 908)),
         "/api/v1/files/89" => ok(file(0, 89, "Course.pdf", 1, 909)),
@@ -1106,4 +1120,43 @@ async fn a_given_course_is_looked_up_only_when_a_file_needs_it() {
     );
     let err = results[2].as_ref().unwrap_err();
     assert!(err.contains("course 4, not course 1"), "{err}");
+}
+
+#[tokio::test]
+async fn media_files_save_whatever_size_canvas_reports_and_are_kept() {
+    let fake = fake_canvas().await;
+    let c = client(&fake.base);
+    let (root, canonical) = root("media");
+    // A get: Canvas says 2 bytes and sends 14.
+    let first = canvas_sync::get_own_files(&c, &root, &[own(500, 86)], canvas_sync::GET_LOCK_WAIT)
+        .await
+        .unwrap()
+        .0
+        .remove(0)
+        .unwrap();
+    assert!(first.downloaded);
+    assert_eq!(first.size, 14);
+    assert_eq!(
+        read(&canonical, "My files/Coursework/Clip.mp4"),
+        "a longer video"
+    );
+    let again = canvas_sync::get_own_files(&c, &root, &[own(500, 86)], canvas_sync::GET_LOCK_WAIT)
+        .await
+        .unwrap()
+        .0
+        .remove(0)
+        .unwrap();
+    assert!(!again.downloaded);
+    assert_eq!(again.size, 14);
+    assert_eq!(fake.count("/dl/86"), 1);
+    // A sync: Canvas says 1 byte and sends 9; the next sync keeps it.
+    let med = course(6, "MED");
+    let report = sync(&c, &med, &root, false).await;
+    assert_eq!(report.downloaded, vec!["MED/Talk.mp4".to_owned()]);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    let report = sync(&c, &med, &root, false).await;
+    assert!(report.downloaded.is_empty(), "{report:?}");
+    assert_eq!(report.unchanged, 1);
+    assert_eq!(fake.count("/dl/61"), 1);
+    assert_eq!(manifest(&canonical, 6)["files"]["61"]["bytes"], 9);
 }

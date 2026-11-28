@@ -64,6 +64,11 @@ pub struct CanvasFile {
     /// Why it is locked, e.g. until a date. Canvas text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_explanation: Option<String>,
+    /// Set for audio and video that Canvas also keeps as media. Their
+    /// `size` need not be what the download sends (seen: 5 KB recorded,
+    /// 4.4 MB sent), so it cannot be used to check the download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_entry_id: Option<String>,
 }
 
 /// A folder of a course or a user, used to place files on disk.
