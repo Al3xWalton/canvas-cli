@@ -37,6 +37,13 @@
 //! - **Contained.** Every name from Canvas is sanitised, and the final
 //!   path is checked to be inside `root`, so a hostile name cannot write
 //!   elsewhere.
+//! - **Own files.** [`get_own_files`] fetches files from the signed-in
+//!   user's own files (`/users/<id>/files/<file>` links), which belong to
+//!   no course, into `<root>/My files/<folder>/`, with their own manifest
+//!   and lock (`own`). Only the user's own files: another user's link is
+//!   refused unasked, and a file is saved only if the signed-in user holds
+//!   its folder. [`get`] takes ids and links as typed and sends each where
+//!   it belongs.
 //! - **Pages.** [`save_pages`] saves wiki pages as Markdown in the same
 //!   layout; see the `pages` module.
 //! - **Honest.** Files that could not be fetched are listed in `failed`.
@@ -48,7 +55,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use canvas_api::{CanvasFile, Client, Course, Module};
+use canvas_api::{CanvasFile, Client, Course, FileTarget, Module, UserFile};
 use canvas_core::{Error, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -141,7 +148,7 @@ pub struct FileList {
     pub warnings: Vec<String>,
 }
 
-/// A file saved by [`get_files`].
+/// A file saved by [`get_files`], [`get_own_files`] or [`get`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SavedFile {
     /// Where it is on disk.
@@ -543,24 +550,61 @@ fn claim(held: &mut HashMap<String, u64>, names: &[PathBuf; 2], id: u64) -> Opti
     Some(free)
 }
 
-/// A course's manifest on disk, shared by syncs and gets that may run at
-/// the same time, in this process or another.
+/// Whose files a manifest records: a course's, or the user's own files,
+/// which belong to no course. Own files share one manifest per root (as
+/// they share `My files/`), so two accounts using one root never write
+/// over each other's copies.
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    Course(u64),
+    Own,
+}
+
+impl Scope {
+    /// The manifest's name in `.canvas-sync`, before its extension.
+    fn key(self) -> String {
+        match self {
+            Self::Course(id) => id.to_string(),
+            Self::Own => "own".to_owned(),
+        }
+    }
+
+    /// The runs that share this manifest, for messages.
+    fn runs(self) -> String {
+        match self {
+            Self::Course(id) => format!("sync or get of course {id}"),
+            Self::Own => "get of your own files".to_owned(),
+        }
+    }
+
+    /// Asks Canvas for file `id` where this scope's files live.
+    async fn file(self, client: &Client, id: u64) -> Result<CanvasFile> {
+        match self {
+            Self::Course(course) => client.file(course, id).await,
+            Self::Own => client.file_by_id(id).await,
+        }
+    }
+}
+
+/// A course's (or the user's own files') manifest on disk, shared by syncs
+/// and gets that may run at the same time, in this process or another.
 struct Store {
-    course_id: u64,
+    scope: Scope,
     dir: PathBuf,
     path: PathBuf,
     lock: PathBuf,
-    /// Temp files for this course's downloads. Only the lock holder
-    /// downloads for the course, so it may empty this.
+    /// Temp files for this scope's downloads. Only the lock holder
+    /// downloads for the scope, so it may empty this.
     tmp: PathBuf,
 }
 
-/// How long a get waits for another sync or get of the same course when
-/// called for an agent: under the usual 60-second MCP request timeout.
+/// How long a get waits for another sync or get of the same course (or
+/// get of the user's own files) when called for an agent: under the usual
+/// 60-second MCP request timeout.
 pub const GET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// How long a sync (or a get run from a terminal) waits for another sync
-/// or get of the same course.
+/// or get of the same course, or get of the user's own files.
 pub const SYNC_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Temp files older than this at the top of `.canvas-sync/tmp` (left by
@@ -568,19 +612,20 @@ pub const SYNC_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1
 const STALE_TEMP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl Store {
-    fn new(sync_dir: &Path, course_id: u64) -> Self {
+    fn new(sync_dir: &Path, scope: Scope) -> Self {
+        let key = scope.key();
         Self {
-            course_id,
+            scope,
             dir: sync_dir.to_owned(),
-            path: sync_dir.join(format!("{course_id}.json")),
-            lock: sync_dir.join(format!("{course_id}.lock")),
-            tmp: sync_dir.join("tmp").join(course_id.to_string()),
+            path: sync_dir.join(format!("{key}.json")),
+            lock: sync_dir.join(format!("{key}.lock")),
+            tmp: sync_dir.join("tmp").join(key),
         }
     }
 
     /// Reads the manifest. A missing one is empty. One that is not a
     /// manifest (bad JSON, or not text) is kept aside as
-    /// `<id>.json.unreadable-<time>` and a new one started, with a warning.
+    /// `<key>.json.unreadable-<time>` and a new one started, with a warning.
     ///
     /// # Errors
     /// [`Error::Io`] if the file cannot be read (say a network drive
@@ -618,7 +663,7 @@ impl Store {
         Ok(Manifest::default())
     }
 
-    /// Takes the course's lock, waiting (without blocking the runtime) up
+    /// Takes the store's lock, waiting (without blocking the runtime) up
     /// to `limit` while another sync or get, in any process, holds it, and
     /// clears temp files an interrupted run left. The lock is released when
     /// the returned file is dropped.
@@ -650,9 +695,9 @@ impl Store {
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(Error::Input(format!(
-                        "another sync or get of course {} has been running for over {}s; \
+                        "another {} has been running for over {}s; \
                          try again when it finishes",
-                        self.course_id,
+                        self.scope.runs(),
                         limit.as_secs()
                     )));
                 }
@@ -660,8 +705,9 @@ impl Store {
                     if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(std::fs::TryLockError::Error(e)) => {
                     warnings.push(format!(
-                        "this folder cannot lock files ({e}), so a sync or get of the same \
-                         course running at the same time is not guarded against"
+                        "this folder cannot lock files ({e}), so another {} running at the \
+                         same time is not guarded against",
+                        self.scope.runs()
                     ));
                     break None;
                 }
@@ -670,7 +716,8 @@ impl Store {
         let waited = start.elapsed().as_secs();
         if waited >= 1 {
             warnings.push(format!(
-                "waited {waited}s for another sync or get of this course to finish"
+                "waited {waited}s for another {} to finish",
+                self.scope.runs()
             ));
         }
         if held.is_some() {
@@ -749,7 +796,7 @@ fn record(manifest: &mut Manifest, id: u64, entry: Entry) {
 /// with none costs nothing.
 async fn free_names_of_gone_files(
     client: &Client,
-    course_id: u64,
+    scope: Scope,
     held: &mut HashMap<String, u64>,
     outside: &HashSet<u64>,
     wanted: impl Iterator<Item = &PathBuf>,
@@ -759,7 +806,7 @@ async fn free_names_of_gone_files(
         .filter(|id| outside.contains(id))
         .collect();
     for id in clashing {
-        match client.file(course_id, id).await {
+        match scope.file(client, id).await {
             Err(Error::NotFound(_)) => held.retain(|_, holder| *holder != id),
             Ok(f) if f.id != id => held.retain(|_, holder| *holder != id),
             Err(e @ Error::SessionExpired) => return Err(e),
@@ -796,7 +843,7 @@ pub async fn sync_course(
     let folders = folders_of(client, course, &mut warnings).await?;
 
     let sync_dir = root.join(".canvas-sync");
-    let store = Store::new(&sync_dir, course.id);
+    let store = Store::new(&sync_dir, Scope::Course(course.id));
     // Held until the manifest is written.
     let _lock = store.lock(SYNC_LOCK_WAIT, &mut warnings).await?;
     let tmp_dir = store.tmp.clone();
@@ -848,7 +895,8 @@ pub async fn sync_course(
         .filter(|(file, names)| !holds_one(&held, names, file.id))
         .flat_map(|(_, names)| names.iter().cloned())
         .collect();
-    free_names_of_gone_files(client, course.id, &mut held, &outside, unsettled.iter()).await?;
+    let scope = Scope::Course(course.id);
+    free_names_of_gone_files(client, scope, &mut held, &outside, unsettled.iter()).await?;
     for (file, names) in &planned {
         keep_previous(&mut held, &manifest, names, file.id);
     }
@@ -1050,25 +1098,39 @@ pub async fn get_files(
             break;
         }
     }
-    let store = Store::new(&root.join(".canvas-sync"), course.id);
+    let store = Store::new(&root.join(".canvas-sync"), Scope::Course(course.id));
+    let results = save_all(
+        client,
+        &root,
+        &store,
+        &view.base,
+        prepared,
+        wait,
+        &mut warnings,
+    )
+    .await?;
+    Ok((results, warnings))
+}
+
+/// Takes `store`'s lock (waiting up to `wait`), then names, downloads and
+/// records each prepared file, stopping after an expired session. `base`
+/// is the files a sync of the scope finds.
+async fn save_all(
+    client: &Client,
+    root: &Path,
+    store: &Store,
+    base: &HashSet<u64>,
+    prepared: Vec<Result<Prepared>>,
+    wait: std::time::Duration,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Result<SavedFile>>> {
     // Held until the last file is recorded.
-    let _lock = store.lock(wait, &mut warnings).await?;
-    let mut manifest = store.load(&mut warnings)?;
+    let _lock = store.lock(wait, warnings).await?;
+    let mut manifest = store.load(warnings)?;
     let mut results = Vec::new();
     for one in prepared {
         let result = match one {
-            Ok(p) => {
-                save_one(
-                    client,
-                    &root,
-                    &store,
-                    &view,
-                    &mut manifest,
-                    p,
-                    &mut warnings,
-                )
-                .await
-            }
+            Ok(p) => save_one(client, root, store, base, &mut manifest, p, warnings).await,
             Err(e) => Err(e),
         };
         let expired = matches!(result, Err(Error::SessionExpired));
@@ -1077,7 +1139,7 @@ pub async fn get_files(
             break;
         }
     }
-    Ok((results, warnings))
+    Ok(results)
 }
 
 /// Downloads one file for an agent, as [`get_files`] does with
@@ -1098,6 +1160,312 @@ pub async fn get_file(
         .unwrap_or_else(|| Err(Error::Input(format!("file {file_id} was not fetched"))))?;
     saved.warnings.splice(0..0, warnings);
     Ok(saved)
+}
+
+/// Downloads files from the signed-in user's own files (`/users/<id>/files/
+/// <file>` links), each into `<root>/My files/<its folder>/`, and records
+/// them in the manifest `.canvas-sync/own.json`. A file already up to date
+/// is not downloaded again. `wait` is as for [`get_files`].
+///
+/// Only the user's own files are fetched: a link naming another user is
+/// refused before anything is asked, and a file is saved only if its
+/// folder is held by the signed-in user. Everything is read with GET
+/// (`/api/v1/users/self`, `/api/v1/files/<id>`, `/api/v1/folders/<id>`).
+///
+/// # Errors
+/// As for [`get_files`]. Per file: [`Error::Input`] for a link naming
+/// another user or a file that is not in the user's own files, and
+/// [`Error::NotFound`] or [`Error::Forbidden`] when Canvas hides, refuses
+/// or locks it.
+pub async fn get_own_files(
+    client: &Client,
+    root: &Path,
+    files: &[UserFile],
+    wait: std::time::Duration,
+) -> Result<(Vec<Result<SavedFile>>, Vec<String>)> {
+    let io = |path: &Path| {
+        let path = path.to_owned();
+        move |source| Error::Io { path, source }
+    };
+    std::fs::create_dir_all(root).map_err(io(root))?;
+    let root = root.canonicalize().map_err(io(root))?;
+    let me = client.current_user().await?.id;
+    let mut warnings = Vec::new();
+    let mut prepared = Vec::new();
+    for &file in files {
+        let one = prepare_own(client, me, file).await;
+        let expired = matches!(one, Err(Error::SessionExpired));
+        prepared.push(one);
+        if expired {
+            break;
+        }
+    }
+    let store = Store::new(&root.join(".canvas-sync"), Scope::Own);
+    // No sync reads the user's own files, so every recorded one is kept
+    // clear of as a file from elsewhere.
+    let results = save_all(
+        client,
+        &root,
+        &store,
+        &HashSet::new(),
+        prepared,
+        wait,
+        &mut warnings,
+    )
+    .await?;
+    Ok((results, warnings))
+}
+
+/// Downloads files named as a person or agent gives them: each a file id
+/// (which needs `course`), a course file link, or a link into the user's
+/// own files. Course files go where a sync would put them ([`get_files`]),
+/// one batch per course; own files go under `My files/` ([`get_own_files`]).
+/// Returns one result per entry of `files`, in the same order, plus the
+/// warnings of every batch.
+///
+/// `course` is looked up only when a file needs it (an id, or a course
+/// link, which must then be in it); a course link without it names its own
+/// course, and links into the user's own files belong to no course.
+///
+/// # Errors
+/// [`Error::SessionExpired`], `course` matching no course (or several), or
+/// a root that cannot be used. Per file: an argument that is not a file,
+/// or any error of [`get_files`] and [`get_own_files`], which a batch that
+/// failed as a whole gives each of its files. Once the session expires,
+/// every file not yet saved is [`Error::SessionExpired`].
+pub async fn get(
+    client: &Client,
+    root: &Path,
+    course: Option<&str>,
+    files: &[String],
+    wait: std::time::Duration,
+) -> Result<(Vec<Result<SavedFile>>, Vec<String>)> {
+    std::fs::create_dir_all(root).map_err(|source| Error::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    let needs_course = files
+        .iter()
+        .any(|f| !matches!(client.file_target(None, f), Ok(FileTarget::User(_))));
+    let given = match course.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(text) if needs_course => Some(canvas_api::resolve_course(client, text).await?),
+        _ => None,
+    };
+    let mut results: Vec<Option<Result<SavedFile>>> = files.iter().map(|_| None).collect();
+    // Course id → (position in `files`, file id), in order of first
+    // mention, so each course is read once.
+    let mut batches: Vec<(u64, Vec<(usize, u64)>)> = Vec::new();
+    let mut own: Vec<(usize, UserFile)> = Vec::new();
+    for (i, text) in files.iter().enumerate() {
+        match client.file_target(given.as_ref().map(|c| c.id), text) {
+            Ok(FileTarget::Course { course_id, file_id }) => {
+                match batches.iter_mut().find(|(c, _)| *c == course_id) {
+                    Some((_, picks)) => picks.push((i, file_id)),
+                    None => batches.push((course_id, vec![(i, file_id)])),
+                }
+            }
+            Ok(FileTarget::User(file)) => own.push((i, file)),
+            Err(e) => results[i] = Some(Err(e)),
+        }
+    }
+    let mut warnings = Vec::new();
+    let mut listed: Option<Vec<Course>> = None;
+    let mut expired = false;
+    for (course_id, picks) in batches {
+        if expired {
+            break;
+        }
+        let (positions, ids): (Vec<usize>, Vec<u64>) = picks.into_iter().unzip();
+        let batch = match course_by_id(client, given.as_ref(), course_id, &mut listed).await {
+            Ok(c) => get_files(client, &c, root, &ids, wait).await,
+            Err(e) => Err(e),
+        };
+        expired = place(&mut results, &positions, batch, &mut warnings);
+    }
+    if !expired && !own.is_empty() {
+        let (positions, links): (Vec<usize>, Vec<UserFile>) = own.into_iter().unzip();
+        let batch = get_own_files(client, root, &links, wait).await;
+        place(&mut results, &positions, batch, &mut warnings);
+    }
+    // Only files left untried after the session expired have no result.
+    let results = results
+        .into_iter()
+        .map(|r| r.unwrap_or(Err(Error::SessionExpired)))
+        .collect();
+    Ok((results, warnings))
+}
+
+/// Downloads one file for an agent, as [`get`] does with
+/// [`GET_LOCK_WAIT`], with the batch's warnings in [`SavedFile::warnings`].
+///
+/// # Errors
+/// As for [`get`], with the file's own error returned directly.
+pub async fn get_one(
+    client: &Client,
+    root: &Path,
+    course: Option<&str>,
+    file: &str,
+) -> Result<SavedFile> {
+    let (results, warnings) = get(client, root, course, &[file.to_owned()], GET_LOCK_WAIT).await?;
+    let mut saved = results
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Err(Error::Input(format!("`{file}` was not fetched"))))?;
+    saved.warnings.splice(0..0, warnings);
+    Ok(saved)
+}
+
+/// Course `id`: `given` if it is that course, else from the user's course
+/// list, read once per call of [`get`].
+async fn course_by_id(
+    client: &Client,
+    given: Option<&Course>,
+    id: u64,
+    listed: &mut Option<Vec<Course>>,
+) -> Result<Course> {
+    if let Some(c) = given.filter(|c| c.id == id) {
+        return Ok(c.clone());
+    }
+    if listed.is_none() {
+        *listed = Some(client.courses().await?);
+    }
+    listed
+        .iter()
+        .flatten()
+        .find(|c| c.id == id)
+        .cloned()
+        .ok_or_else(|| Error::Input(format!("no active course with id {id}")))
+}
+
+/// Puts one batch's results at `positions` in `results`. A batch that
+/// failed as a whole gives each of its files that failure. Returns true if
+/// the session expired.
+fn place(
+    results: &mut [Option<Result<SavedFile>>],
+    positions: &[usize],
+    batch: Result<(Vec<Result<SavedFile>>, Vec<String>)>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let (saved, batch_warnings) = match batch {
+        Ok(batch) => batch,
+        Err(Error::SessionExpired) => {
+            for &i in positions {
+                results[i] = Some(Err(Error::SessionExpired));
+            }
+            return true;
+        }
+        Err(e) => {
+            let why = e.to_string();
+            for &i in positions {
+                results[i] = Some(Err(Error::Input(why.clone())));
+            }
+            return false;
+        }
+    };
+    warnings.extend(batch_warnings);
+    let mut saved = saved.into_iter();
+    let mut expired = false;
+    for &i in positions {
+        // A batch stops after an expired session, so later files have no
+        // result of their own.
+        let result = saved.next().unwrap_or(Err(Error::SessionExpired));
+        expired |= matches!(result, Err(Error::SessionExpired));
+        results[i] = Some(result);
+    }
+    expired
+}
+
+/// The folder under the root for the user's own files.
+const OWN_FILES_DIR: &str = "My files";
+
+/// Reads one of the signed-in user's (`me`) own files and works out where
+/// it goes: `My files`, then its Canvas folder below the top one, `my
+/// files`. Refuses a link naming another user without asking Canvas, and
+/// a file whose folder another user, a course or a group holds.
+async fn prepare_own(client: &Client, me: u64, link: UserFile) -> Result<Prepared> {
+    let id = link.file_id;
+    if link.user_id != me {
+        return Err(Error::Input(format!(
+            "file {id} is in the files of user {}, not yours; only your own files can be \
+             fetched",
+            link.user_id
+        )));
+    }
+    let what = format!("file {id} in your own files");
+    let file = match client.file_by_id(id).await {
+        Ok(f) => f,
+        Err(Error::NotFound(_)) => {
+            return Err(Error::NotFound(format!(
+                "{what} (it may have been deleted)"
+            )));
+        }
+        Err(Error::Forbidden(_)) => {
+            return Err(Error::Forbidden(format!(
+                "{what}: Canvas does not let you open it"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let not_yours = |why: String| {
+        Error::Input(format!(
+            "file {id} {why}; only your own files can be fetched"
+        ))
+    };
+    let folder_id = file
+        .folder_id
+        .ok_or_else(|| not_yours("has no folder, so it cannot be checked as yours".into()))?;
+    // Hidden or refused: it cannot be shown to be yours. Anything else
+    // (Canvas busy, a bad response) is passed on as it is, to try again.
+    let folder = match client.folder(folder_id).await {
+        Ok(f) => f,
+        Err(e @ (Error::NotFound(_) | Error::Forbidden(_))) => {
+            return Err(not_yours(format!(
+                "could not be checked as yours: its folder could not be read ({e})"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    if folder.context_type.as_deref() != Some("User") || folder.context_id != Some(me) {
+        return Err(not_yours("is not in your own files".into()));
+    }
+    check_unlocked(&file, &what)?;
+    Ok(Prepared {
+        folder: own_folder(&folder.full_name),
+        file,
+        linked: true,
+        what,
+    })
+}
+
+/// Where one of the user's own files goes under the root: `My files`, then
+/// the folder's path without the leading `my files`, each part sanitised.
+fn own_folder(full_name: &str) -> PathBuf {
+    let mut rel = PathBuf::from(OWN_FILES_DIR);
+    let parts = full_name.split('/').skip_while(|p| *p == "my files");
+    for part in parts.filter(|p| !p.is_empty()) {
+        rel.push(sanitize(part));
+    }
+    rel
+}
+
+/// Fails with [`Error::Forbidden`] if `file` is locked for the user, with
+/// Canvas's reason when it gives one.
+fn check_unlocked(file: &CanvasFile, what: &str) -> Result<()> {
+    if !file.locked_for_user && !file.url.is_empty() {
+        return Ok(());
+    }
+    // Names and lock reasons are Canvas text: quoted, never bare.
+    let why = file
+        .lock_explanation
+        .as_deref()
+        .map(canvas_api::html_to_markdown)
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("; Canvas says {w:?}"))
+        .unwrap_or_default();
+    Err(Error::Forbidden(format!(
+        "{:?} ({what}) is locked{why}",
+        file.display_name
+    )))
 }
 
 /// A file read and placed, ready to save.
@@ -1136,20 +1504,7 @@ async fn prepare(
         }
         Err(e) => return Err(e),
     };
-    // Names and lock reasons are Canvas text: quoted, never bare.
-    if file.locked_for_user || file.url.is_empty() {
-        let why = file
-            .lock_explanation
-            .as_deref()
-            .map(canvas_api::html_to_markdown)
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("; Canvas says {w:?}"))
-            .unwrap_or_default();
-        return Err(Error::Forbidden(format!(
-            "{:?} ({what}) is locked{why}",
-            file.display_name
-        )));
-    }
+    check_unlocked(&file, &what)?;
     // Canvas answers a replaced file's old id with its replacement, which
     // is then saved under its own id; links may name either.
     let ids = [id, file.id];
@@ -1175,12 +1530,12 @@ async fn prepare(
 }
 
 /// Names, downloads and records one prepared file. The caller holds the
-/// course's lock.
+/// store's lock. `base` is the files a sync of the scope finds.
 async fn save_one(
     client: &Client,
     root: &Path,
     store: &Store,
-    view: &CourseView,
+    base: &HashSet<u64>,
     manifest: &mut Manifest,
     p: Prepared,
     warnings: &mut Vec<String>,
@@ -1200,7 +1555,7 @@ async fn save_one(
     for (other, e) in &manifest.files {
         if *other != id && root.join(&e.path).is_file() {
             held.insert(e.path.to_lowercase(), *other);
-            if !view.base.contains(other) {
+            if !base.contains(other) {
                 outside.insert(*other);
             }
         }
@@ -1208,8 +1563,7 @@ async fn save_one(
     let names = names(&folder, &sanitize(&file.display_name), id);
     keep_previous(&mut held, manifest, &names, id);
     if !holds_one(&held, &names, id) {
-        free_names_of_gone_files(client, store.course_id, &mut held, &outside, names.iter())
-            .await?;
+        free_names_of_gone_files(client, store.scope, &mut held, &outside, names.iter()).await?;
         keep_previous(&mut held, manifest, &names, id);
     }
     let rel = claim(&mut held, &names, id).ok_or_else(|| {
@@ -1383,6 +1737,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn own_files_go_under_my_files_by_folder_and_stay_inside() {
+        assert_eq!(own_folder("my files"), Path::new("My files"));
+        assert_eq!(
+            own_folder("my files/Coursework/Week 1"),
+            Path::new("My files/Coursework/Week 1")
+        );
+        for hostile in [
+            "my files/../../etc",
+            "../..",
+            "my files//a/../b",
+            "x/C:\\evil",
+        ] {
+            let rel = own_folder(hostile);
+            assert!(rel.starts_with(OWN_FILES_DIR), "{rel:?}");
+            assert!(
+                is_inside(Path::new("/r"), &Path::new("/r").join(&rel)),
+                "{rel:?}"
+            );
+        }
+    }
+
     fn entry(path: &str) -> Entry {
         Entry {
             path: path.into(),
@@ -1438,7 +1814,7 @@ mod tests {
     fn manifest_merges_keep_other_writers_entries() {
         let dir = std::env::temp_dir().join(format!("canvas-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::new(&dir, 1);
+        let store = Store::new(&dir, Scope::Course(1));
         let mut warnings = Vec::new();
         store
             .merge(&BTreeMap::from([(5, entry("a"))]), &mut warnings)
@@ -1488,7 +1864,7 @@ mod tests {
     async fn a_busy_course_lock_gives_up_with_a_clear_error() {
         let dir = std::env::temp_dir().join(format!("canvas-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::new(&dir, 1);
+        let store = Store::new(&dir, Scope::Course(1));
         let mut warnings = Vec::new();
         let first = store.lock(GET_LOCK_WAIT, &mut warnings).await.unwrap();
         assert!(first.is_some());

@@ -96,12 +96,17 @@ each list tool below names its key.
   `failed`, and `unavailable` for page links Canvas no longer serves).
   `linked: true` also downloads files linked from inside module pages.
   Many courses hide the Files tab and link slides only from pages.
-- `get_file` (`course`, `file`: an `id` from `list_files` or a Canvas file
-  link): download one file to where a sync would put it, and return its
-  `path`, with `id`, `name`, `size`, `updated_at` and `downloaded` (false
-  if the local copy was already up to date) and any `warnings`. A later
-  sync treats it as known. A locked or refused file is an error saying so.
-  It waits up to 45 seconds if a sync of the same course is running.
+- `get_file` (`file`: an `id` from `list_files` or a Canvas file link;
+  `course`, needed for an `id`): download one file and return its `path`,
+  with `id`, `name`, `size`, `updated_at`, `downloaded` (false if the
+  local copy was already up to date) and any `warnings`. A locked or
+  refused file is an error saying so.
+  - A course file goes where a sync would put it, and a later sync treats
+    it as known. It waits up to 45 seconds if a sync of the same course is
+    running.
+  - A link into the user's own files (`…/users/<id>/files/<id>`) needs no
+    `course` and is saved under `My files/<folder>/`. Only the user's own
+    files: a link to another user's files is refused.
 
 ## Lectures (ReCap)
 - `list_recordings` (`course`): `recordings`, newest first, with `id`,

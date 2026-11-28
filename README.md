@@ -105,8 +105,9 @@ command for machine-readable output.
 - `discussions <course> <topic>`, or `discussions <link>`: read a whole discussion, with every reply threaded under the post it answers. Name the topic by its id from the list, part of its title, or its Canvas link.
 - `digest`: what's new since the last run (announcements, assignments, files, recordings), plus what's due soon.
 - `files list <course>`: a course's files from the Files tab, modules and links inside module pages.
-- `files sync <course|--all> [--linked]`: download new and changed course files to `~/Canvas`. `--linked` also downloads files linked from inside module pages, which is where many courses keep their slides.
-- `files get <course> <file>...`: download particular files, by id or Canvas file link (e.g. `…/courses/<id>/files/<id>?wrap=1`), to where a sync would put them. Prints each saved path. Page links Canvas no longer serves are reported, not counted as failures.
+- `files sync <course|--all> [--linked]`: download new and changed course files to `~/Canvas`. `--linked` also downloads files linked from inside module pages, which is where many courses keep their slides. Page links Canvas no longer serves are reported, not counted as failures.
+- `files get <course> <file>...`: download particular files, by id or Canvas file link (e.g. `…/courses/<id>/files/<id>?wrap=1`), to where a sync would put them. Prints each saved path, in the order given. With links only, the course can be left out: `files get <link>...`.
+- Links into your own files (`…/users/<id>/files/<id>`) are saved under `My files/<folder>/`. Only your own files: another user's link is refused.
 - `files sync` and `files get` take `--root <dir>` to write somewhere other than the configured folder.
 - `recap list <course>`, `recap info <recording>`: a course's lecture recordings, with chapters.
 - `recap download <recording|course> --latest N`: save lectures as MP4. Interrupted downloads resume.

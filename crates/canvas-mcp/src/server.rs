@@ -97,13 +97,16 @@ pub struct SyncArgs {
     pub linked: bool,
 }
 
-/// One course file to download.
+/// One file to download: a course's, or one of the user's own.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct GetFileArgs {
-    /// Course id, code or part of the name.
-    pub course: String,
-    /// The file: its id (`12345678`, from `list_files`) or a Canvas file
-    /// link (`…/courses/<id>/files/<id>`, with any `?wrap=1` or `/download`).
+    /// Course id, code or part of the name. Needed for a file id; may be
+    /// left out for a link.
+    #[serde(default)]
+    pub course: Option<String>,
+    /// The file: its id (`12345678`, from `list_files`), a course file link
+    /// (`…/courses/<id>/files/<id>`, with any `?wrap=1` or `/download`), or
+    /// a link into the user's own files (`…/users/<id>/files/<id>`).
     pub file: String,
 }
 
@@ -538,19 +541,18 @@ impl CanvasServer {
 
     /// Downloads one file.
     #[tool(
-        description = "Download one course file, by id or Canvas file link (e.g. one linked from inside a page), into the download root where a sync would put it. Returns {path, id, name, size, updated_at, downloaded, warnings}. Waits up to 45s if a sync of the same course is running."
+        description = "Download one file into the download root and return {path, id, name, size, updated_at, downloaded, warnings}. A course file, by id (with `course`) or Canvas file link (e.g. one linked from inside a page), goes where a sync would put it; it waits up to 45s if a sync of the same course is running. One of the user's own files, by a `/users/<id>/files/<id>` link (no course needed), goes under `My files/`; another user's files are refused."
     )]
     async fn get_file(&self, Parameters(args): Parameters<GetFileArgs>) -> CallToolResult {
-        let course = match canvas_api::resolve_course(&self.client, &args.course).await {
-            Ok(c) => c,
-            Err(e) => return fail(e),
-        };
-        match self.client.resolve_file(course.id, &args.file) {
-            Ok(id) => done(
-                canvas_sync::get_file(&self.client, &course, &self.config.download_root, id).await,
-            ),
-            Err(e) => fail(e),
-        }
+        done(
+            canvas_sync::get_one(
+                &self.client,
+                &self.config.download_root,
+                args.course.as_deref(),
+                &args.file,
+            )
+            .await,
+        )
     }
 
     /// Lists a course's ReCap recordings.
@@ -971,6 +973,12 @@ mod tests {
             ),
             "/api/v1/courses/1/folders" => r#"[{"id":3,"full_name":"course files"}]"#.into(),
             "/files/71/download" => "hello".into(),
+            // The user's own file 81, in their folder `my files/Notes`.
+            "/api/v1/files/81" => format!(
+                r#"{{"id":81,"display_name":"Plan.pdf","size":4,"updated_at":"2026-10-01T09:00:00Z","folder_id":8,"url":"{base}/files/81/download"}}"#
+            ),
+            "/api/v1/folders/8" => r#"{"id":8,"full_name":"my files/Notes","context_type":"User","context_id":7}"#.into(),
+            "/files/81/download" => "plan".into(),
             "/api/v1/announcements" => r#"[{"id":31,"title":"Welcome","message":"<p>Hello</p>","context_code":"course_1"}]"#.into(),
             "/api/v1/courses/1/discussion_topics" => r#"[{"id":41,"title":"Questions"}]"#.into(),
             "/api/v1/courses/1/discussion_topics/41" => r#"{"id":41,"title":"Questions","message":"<p>Ask here</p>","discussion_subentry_count":2,"user_can_see_posts":true,"group_topic_children":[]}"#.into(),
@@ -1140,6 +1148,22 @@ mod tests {
             (saved["id"].clone(), saved["size"].clone()),
             (json!(71), json!(5))
         );
+
+        // A link into the user's own files needs no course.
+        let link = format!("{base}/users/7/files/81?verifier=v");
+        let params = json!({ "name": "get_file", "arguments": { "file": link } });
+        let result = rpc(&mut write, &mut lines, 105, "tools/call", params).await;
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let path = std::path::PathBuf::from(result["structuredContent"]["path"].as_str().unwrap());
+        assert!(path.ends_with("My files/Notes/Plan.pdf"), "{result}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"plan");
+
+        // Another user's link is refused.
+        let link = format!("{base}/users/8/files/81");
+        let params = json!({ "name": "get_file", "arguments": { "file": link } });
+        let result = rpc(&mut write, &mut lines, 106, "tools/call", params).await;
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(result.to_string().contains("not yours"), "{result}");
         std::fs::remove_dir_all(&download_root).unwrap();
     }
 
